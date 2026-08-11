@@ -1,71 +1,54 @@
-# review_agent/rubric.yaml
-# Rigid, weighted evaluation rubric. Weights must sum to 100.
-# Hard gates override the weighted score entirely — see decision_engine.py.
-
 categories:
   correctness:
-    weight: 25
+    weight: 28
     description: >
       Logic errors, incorrect edge-case handling, off-by-one errors,
-      broken control flow, incorrect state mutation.
-    max_finding_severity_allowed_for_full_score: LOW
+      broken control flow, and incorrect state mutation.
 
   security:
-    weight: 20
+    weight: 22
     description: >
-      Injection risks, unsafe eval/exec, unsafe deserialization,
-      hardcoded secrets, unsafe file/path handling, unvalidated input
-      reaching sensitive operations.
-    max_finding_severity_allowed_for_full_score: LOW
-    hard_gate: true          # any CRITICAL here forces REJECT
+      Injection risks, unsafe eval/exec, hardcoded secrets, unsafe
+      file/path handling, and unvalidated input reaching sensitive operations.
+    hard_gate: true
     hard_gate_severity: CRITICAL
 
   error_handling:
-    weight: 10
+    weight: 11
     description: >
-      Missing try/except around risky operations, silent failures,
-      unchecked None returns, unvalidated user input from input().
+      Missing handling around risky operations, silent failures,
+      unchecked None values, and invalid user input.
 
   maintainability_and_style:
-    weight: 10
+    weight: 11
     description: >
-      PEP 8 adherence, naming consistency, function size/complexity,
-      duplication, consistency with existing legacy code conventions.
-
-  test_coverage_signal:
-    weight: 10
-    description: >
-      Whether new/changed logic has corresponding test additions or
-      updates. Does NOT execute tests (out of scope — QA agent handles
-      that); only checks presence/absence and relevance of test changes.
+      Naming consistency, function complexity, duplication, readability,
+      and maintainability.
 
   documentation:
-    weight: 5
+    weight: 6
     description: >
-      Docstrings/comments for new public functions and non-obvious logic.
+      Documentation for public functions and non-obvious logic.
 
   performance_and_resources:
-    weight: 5
+    weight: 6
     description: >
-      Unbounded loops, unnecessary O(n^2) patterns on growing collections,
-      unclosed resources, redundant recomputation.
+      Unbounded loops, unnecessary expensive operations, resource leaks,
+      and redundant computation.
 
   backward_compatibility:
-    weight: 10
+    weight: 11
     description: >
       Breaking changes to existing function signatures, return types,
-      or stored data shapes used elsewhere in the codebase.
-    hard_gate: true          # any HIGH here forces at least HUMAN_REVIEW
+      or data shapes used elsewhere.
+    hard_gate: true
     hard_gate_severity: HIGH
 
   architecture_consistency:
     weight: 5
     description: >
-      Follows the existing module boundaries (models/storage/cli separation)
-      instead of introducing ad hoc coupling or bypassing the storage layer.
+      Consistency with existing module boundaries and design patterns.
 
 decision_thresholds:
   auto_approve_min_score: 90
   human_review_min_score: 60
-  # score < human_review_min_score -> REJECT
-  # Hard gates always override thresholds, evaluated first.
