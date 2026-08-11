@@ -28,7 +28,7 @@ def compute_weighted_score(rubric: Dict[str, Any], category_scores: Dict[str, fl
     total = 0.0
     weight_sum = 0.0
     for name, cfg in rubric["categories"].items():
-        score = category_scores.get(name, 0)
+        score = category_scores.get(name, 100)
         weight = cfg["weight"]
         total += score * weight
         weight_sum += weight

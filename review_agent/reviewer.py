@@ -246,6 +246,50 @@ def preflight_check(system_prompt: str, user_prompt: str, max_output_tokens: int
     return estimated
 
 
+def ensure_all_categories_present(
+    rubric: Dict[str, Any],
+    reviewer_output: Dict[str, Any],
+) -> Dict[str, Any]:
+    """
+    Guarantee every rubric category exists in the LLM output.
+    If the model omitted a category entirely (commonly happens when it finds
+    no issues in that category), backfill it with a clean 100/no-findings
+    entry rather than letting it silently default to 0 downstream.
+    """
+    categories = reviewer_output.get("categories", {})
+    if categories is None:
+        categories = {}
+
+    for category_name in rubric["categories"]:
+        if category_name not in categories or not isinstance(categories[category_name], dict):
+            categories[category_name] = {"score": 100, "findings": []}
+        else:
+            entry = categories[category_name]
+            if "score" not in entry or not isinstance(entry.get("score"), (int, float)):
+                entry["score"] = 100
+            if "findings" not in entry or not isinstance(entry.get("findings"), list):
+                entry["findings"] = []
+
+    reviewer_output["categories"] = categories
+    return reviewer_output
+
+def run_reviewer_pass(
+    key_pool: GroqKeyPool,
+    model: str,
+    rubric: Dict[str, Any],
+    context_text: str,
+    static_analysis_report: str,
+) -> Dict[str, Any]:
+    user_prompt = (
+        f"## Rubric\n{render_rubric_compact(rubric)}\n\n"
+        f"## Static analysis\n{static_analysis_report}\n\n"
+        f"## Code context\n{context_text}"
+    )
+    reviewer_output = call_groq_json(
+        key_pool, model, REVIEWER_SYSTEM_PROMPT, user_prompt, REVIEW_MAX_OUTPUT_TOKENS
+    )
+    return ensure_all_categories_present(rubric, reviewer_output)
+
 def call_groq_json(
     key_pool: GroqKeyPool,
     model: str,
