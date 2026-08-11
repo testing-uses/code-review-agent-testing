@@ -15,6 +15,23 @@ from github_bot import apply_decision
 from repo_map import RepoMap
 from reviewer import review_pull_request
 
+IGNORED_PATH_PREFIXES = (
+    "review_agent/",
+    ".github/",
+    ".review_agent_cache/",
+)
+
+IGNORED_EXACT_PATHS = {
+    ".gitignore",
+}
+
+def is_reviewable_file(file_path: str) -> bool:
+    normalized_path = file_path.replace("\\", "/")
+
+    if normalized_path in IGNORED_EXACT_PATHS:
+        return False
+
+    return not normalized_path.startswith(IGNORED_PATH_PREFIXES)
 
 def get_changed_files(repo_root: str, base_sha: str, head_sha: str):
     result = subprocess.run(
@@ -35,9 +52,23 @@ def main():
     parser.add_argument("--context-token-budget", type=int, default=3000)
     args = parser.parse_args()
 
-    changed_files = get_changed_files(args.repo_root, args.base_sha, args.head_sha)
+    all_changed_files = get_changed_files(
+    args.repo_root,
+    args.base_sha,
+    args.head_sha,
+    )
+
+    changed_files = [
+        file_path
+        for file_path in all_changed_files
+        if is_reviewable_file(file_path)
+    ]
+
+    print(f"All changed files: {all_changed_files}")
+    print(f"Reviewable files: {changed_files}")
+
     if not changed_files:
-        print("No changed files detected. Skipping review.")
+        print("No reviewable application files changed. Skipping review.")
         sys.exit(0)
 
     repo_map = RepoMap(args.repo_root)

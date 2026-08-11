@@ -47,13 +47,30 @@ def estimate_tokens(text: str) -> int:
     return max(1, int((len(text) / CHARS_PER_TOKEN_ESTIMATE) * SAFETY_MARGIN))
 
 
-def get_narrow_diff(repo_root: str, base_sha: str, head_sha: str) -> str:
-    """Diff with a small context window — this alone usually carries enough
-    signal for review without also needing the full file."""
+def get_narrow_diff(
+    repo_root: str,
+    base_sha: str,
+    head_sha: str,
+    changed_files: List[str],
+) -> str:
+    command = [
+        "git",
+        "diff",
+        f"-U{DIFF_CONTEXT_LINES}",
+        base_sha,
+        head_sha,
+        "--",
+        *changed_files,
+    ]
+
     result = subprocess.run(
-        ["git", "diff", f"-U{DIFF_CONTEXT_LINES}", base_sha, head_sha],
-        cwd=repo_root, capture_output=True, text=True, check=True,
+        command,
+        cwd=repo_root,
+        capture_output=True,
+        text=True,
+        check=True,
     )
+
     return result.stdout
 
 
@@ -105,7 +122,12 @@ def build_context(
     budget = max_tokens
 
     # Priority 1: the narrow diff — always kept.
-    diff_text = get_narrow_diff(repo_root, base_sha, head_sha)
+    diff_text = get_narrow_diff(
+    repo_root,
+    base_sha,
+    head_sha,
+    changed_files,
+    )
     diff_cost = estimate_tokens(diff_text)
 
     if diff_cost > budget:
