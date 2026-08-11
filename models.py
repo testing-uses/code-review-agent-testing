@@ -15,7 +15,6 @@ class Book:
     author: str
     total_copies: int
     available_copies: int
-    unwanted_var: str
 
     def is_available(self) -> bool:
         return self.available_copies > 0

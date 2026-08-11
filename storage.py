@@ -29,7 +29,6 @@ class LibraryStore:
 
     def register_member(self, member_id: str, name: str) -> Member:
         member = Member(member_id, name)
-        # print("user is registered!!!")
         self.members[member_id] = member
         return member
 
