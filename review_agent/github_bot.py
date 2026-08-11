@@ -64,9 +64,30 @@ def apply_decision(repo_full_name: str, pr_number: int, decision, review_result:
     pr.create_issue_comment(comment_body)
 
     if decision.action == "AUTO_APPROVE":
-        pr.create_review(event="APPROVE", body="Auto-approved by review agent.")
+        print("Decision is AUTO_APPROVE.")
+        print("Creating approval review...")
+
+        pr.create_review(
+            event="APPROVE",
+            body="Auto-approved by review agent.",
+        )
+
         pr.add_to_labels(AUTO_APPROVE_LABEL)
-        pr.merge(merge_method="squash")
+
+        print("Attempting to merge pull request...")
+
+        merge_result = pr.merge(
+            merge_method="squash",
+        )
+
+        print(f"Merge result: merged={merge_result.merged}")
+        print(f"Merge message: {merge_result.message}")
+
+        if not merge_result.merged:
+            raise RuntimeError(
+                f"GitHub did not merge the pull request: "
+                f"{merge_result.message}"
+            )
 
     elif decision.action == "HUMAN_REVIEW":
         pr.add_to_labels(HUMAN_REVIEW_LABEL)
