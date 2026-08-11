@@ -1,16 +1,17 @@
 """
-review_agent/reviewer.py
+review_agent/reviewer.py  (v2 — token-optimized)
 
-Two-pass LLM code-review pipeline.
-
-Pass 1:
-    Reviews the pull request against the configured rubric.
-
-Pass 2:
-    Verifies every finding against the provided code context and removes
-    unsupported or hallucinated findings.
-
-The reviewer uses three Groq API keys with fallback handling.
+Changes from v1:
+  - System prompts shortened (no repeated schema prose across both passes;
+    kept to what actually changes model behavior).
+  - Rubric rendered as one compact line per category ("name(weight): focus"),
+    not full-sentence descriptions, in the prompt itself.
+  - Static-analysis output hard-capped in length.
+  - Output token budgets lowered (review pass and verifier pass no longer
+    request more tokens than the decision engine actually needs).
+  - A pre-flight token estimate is computed before every API call; if it
+    would exceed the safe ceiling, the caller degrades context further
+    BEFORE sending (see run_review.py), instead of finding out via a 413.
 """
 
 from __future__ import annotations
@@ -24,236 +25,142 @@ from typing import Any, Dict, List, Tuple
 import yaml
 from groq import APIError, APIStatusError, Groq, RateLimitError
 
-
-RUBRIC_PATH = os.path.join(
-    os.path.dirname(__file__),
-    "rubric.yaml",
-)
+RUBRIC_PATH = os.path.join(os.path.dirname(__file__), "rubric.yaml")
 
 DEFAULT_MODEL = "llama-3.3-70b-versatile"
-REVIEW_MAX_OUTPUT_TOKENS = 3000
-VERIFIER_MAX_OUTPUT_TOKENS = 2500
+
+REVIEW_MAX_OUTPUT_TOKENS = 1200
+VERIFIER_MAX_OUTPUT_TOKENS = 900
+
+# Groq's org-level TPM limit counts prompt + completion together, so we cap
+# the whole request (system + user + expected output) well under it.
+SAFE_REQUEST_TOKEN_CEILING = 8000
+CHARS_PER_TOKEN_ESTIMATE = 3.3
+
+STATIC_ANALYSIS_MAX_CHARS = 800
 
 
 class GroqKeyPool:
-    """
-    Maintains a fallback pool of Groq clients.
-
-    The pool tries the configured keys in order and rotates to the next key
-    when a request receives a rate-limit or temporary API error.
-    """
-
     def __init__(self) -> None:
         self.keys = [
             os.getenv("GROQ_API_KEY_1"),
             os.getenv("GROQ_API_KEY_2"),
             os.getenv("GROQ_API_KEY_3"),
         ]
-
         self.keys = [key for key in self.keys if key]
 
         if not self.keys:
-            raise RuntimeError(
-                "No Groq API keys found. Configure GROQ_API_KEY_1, "
-                "GROQ_API_KEY_2, or GROQ_API_KEY_3."
-            )
+            raise RuntimeError("No Groq API keys configured.")
 
         self.current_index = 0
 
     def clients_in_order(self):
-        """
-        Yield Groq clients beginning at the current key.
-
-        Example:
-            Current key = 2
-            Attempt order = key 2, key 3, key 1
-        """
         key_count = len(self.keys)
-
         for offset in range(key_count):
             index = (self.current_index + offset) % key_count
             yield index, Groq(api_key=self.keys[index])
 
     def mark_success(self, key_index: int) -> None:
-        """Use the successful key first for the next request."""
         self.current_index = key_index
 
     def rotate_after_failure(self, key_index: int) -> None:
-        """Start the next request from the key after the failed key."""
         self.current_index = (key_index + 1) % len(self.keys)
 
 
+def estimate_tokens(text: str) -> int:
+    return max(1, int(len(text) / CHARS_PER_TOKEN_ESTIMATE))
+
+
 def load_rubric() -> Dict[str, Any]:
-    """Load the review rubric from rubric.yaml."""
     with open(RUBRIC_PATH, "r", encoding="utf-8") as file:
         rubric = yaml.safe_load(file)
-
     if not rubric or "categories" not in rubric:
         raise ValueError("Invalid rubric.yaml: categories are missing.")
-
     return rubric
 
 
-def run_static_analysis(
-    repo_root: str,
-    changed_files: List[str],
-) -> str:
-    """
-    Run deterministic static-analysis tools before calling the LLM.
+def render_rubric_compact(rubric: Dict[str, Any]) -> str:
+    """One line per category instead of full prose descriptions."""
+    lines = []
+    for name, config in rubric["categories"].items():
+        focus = config["description"].strip().split(".")[0]
+        lines.append(f"- {name} (weight {config['weight']}): {focus}")
+    return "\n".join(lines)
 
-    The LLM receives these results as evidence. Static analysis is not
-    considered a QA/testing agent here.
-    """
-    python_files = [
-        file_path
-        for file_path in changed_files
-        if file_path.endswith(".py")
-    ]
 
+def run_static_analysis(repo_root: str, changed_files: List[str]) -> str:
+    python_files = [f for f in changed_files if f.endswith(".py")]
     if not python_files:
         return "No Python files changed."
 
     reports: List[str] = []
-
-    tools = [
+    for command, tool_name in [
         (["ruff", "check", *python_files], "ruff"),
         (["bandit", "-q", *python_files], "bandit"),
-    ]
-
-    for command, tool_name in tools:
+    ]:
         try:
             result = subprocess.run(
-                command,
-                cwd=repo_root,
-                capture_output=True,
-                text=True,
-                timeout=30,
-                check=False,
+                command, cwd=repo_root, capture_output=True,
+                text=True, timeout=30, check=False,
             )
-
             output = "\n".join(
-                part.strip()
-                for part in [result.stdout, result.stderr]
-                if part.strip()
-            )
-
-            if not output:
-                output = "No issues found."
-
+                part.strip() for part in [result.stdout, result.stderr] if part.strip()
+            ) or "No issues found."
         except FileNotFoundError:
-            output = f"{tool_name} is not installed."
-
+            output = f"{tool_name} not installed."
         except subprocess.TimeoutExpired:
-            output = f"{tool_name} timed out after 30 seconds."
-
+            output = f"{tool_name} timed out."
         except Exception as error:
             output = f"{tool_name} failed: {error}"
 
         reports.append(f"### {tool_name}\n{output}")
 
-    return "\n\n".join(reports)
+    combined = "\n\n".join(reports)
+    if len(combined) > STATIC_ANALYSIS_MAX_CHARS:
+        combined = combined[:STATIC_ANALYSIS_MAX_CHARS] + "\n...(truncated)"
+    return combined
 
 
-REVIEWER_SYSTEM_PROMPT = """
-You are a rigorous senior software engineer reviewing a pull request.
+REVIEWER_SYSTEM_PROMPT = """Senior code reviewer. Evaluate the given diff and
+context against the rubric categories provided. Ground every finding in the
+actual code shown — never invent issues not evidenced by it.
 
-Review only the code and context provided to you. Do not invent files,
-functions, behavior, requirements, or vulnerabilities that are not supported
-by the provided evidence.
+Severity: CRITICAL (exploitable/crash/data-loss), HIGH (likely bug or major
+violation), MEDIUM (real, non-blocking), LOW (minor/style).
 
-Evaluate every rubric category.
+Return ONLY this JSON, no extra prose:
+{"categories": {"<name>": {"score": 0-100, "findings": [
+  {"severity": "...", "file": "...", "line": 0, "title": "...",
+   "explanation": "...", "recommendation": "..."}]}},
+ "overall_summary": "2-3 sentences"}"""
 
-For each category, return:
-- A score from 0 to 100.
-- A list of actionable findings.
-- An empty findings list when no real issue exists.
+VERIFIER_SYSTEM_PROMPT = """Skeptical verifier. Re-check each finding against
+the provided code. Classify each as confirmed / downgraded / discarded.
+Discard anything referencing code not present in the context.
 
-Severity levels:
-
-CRITICAL:
-    Exploitable security issue, severe data corruption, or a crash during
-    normal usage.
-
-HIGH:
-    Likely functional bug, serious security issue, or major compatibility risk.
-
-MEDIUM:
-    Real issue that should be addressed but is not immediately blocking.
-
-LOW:
-    Minor maintainability, style, or documentation issue.
-
-Do not report:
-- Personal stylistic preferences.
-- Issues unsupported by the supplied code.
-- Duplicate findings.
-- Generic recommendations without a concrete code reference.
-
-Return only valid JSON with this structure:
-
-{
-  "categories": {
-    "<category_name>": {
-      "score": 0,
-      "findings": [
-        {
-          "severity": "CRITICAL | HIGH | MEDIUM | LOW",
-          "file": "path/to/file.py",
-          "line": 1,
-          "title": "Short issue title",
-          "explanation": "Evidence-based explanation",
-          "recommendation": "Specific suggested fix"
-        }
-      ]
-    }
-  },
-  "overall_summary": "Two or three sentence summary"
-}
-"""
+Return ONLY this JSON:
+{"verified_findings": [
+  {"severity": "...", "file": "...", "line": 0, "title": "...",
+   "explanation": "...", "recommendation": "...",
+   "verification_status": "confirmed|downgraded|discarded",
+   "verification_note": "..."}]}"""
 
 
-VERIFIER_SYSTEM_PROMPT = """
-You are a skeptical code-review finding verifier.
-
-You will receive:
-1. The original code context.
-2. Findings generated by another reviewer.
-
-Re-check every finding against the actual code context.
-
-For every finding, classify it as:
-
-confirmed:
-    The issue is real and the original severity is appropriate.
-
-downgraded:
-    The issue is real, but the severity should be lower. Return the corrected
-    severity.
-
-discarded:
-    The issue is unsupported, incorrect, duplicated, or based on code that is
-    not present in the context.
-
-Be conservative. A finding must reference real code and explain a realistic
-impact. Discard vague or speculative findings.
-
-Return only valid JSON:
-
-{
-  "verified_findings": [
-    {
-      "severity": "CRITICAL | HIGH | MEDIUM | LOW",
-      "file": "path/to/file.py",
-      "line": 1,
-      "title": "Short issue title",
-      "explanation": "Evidence-based explanation",
-      "recommendation": "Specific suggested fix",
-      "verification_status": "confirmed | downgraded | discarded",
-      "verification_note": "Why this status was selected"
-    }
-  ]
-}
-"""
+def preflight_check(system_prompt: str, user_prompt: str, max_output_tokens: int) -> int:
+    """Estimate total request tokens; raise before calling the API if this
+    would exceed the safe ceiling, so callers can shrink context first."""
+    estimated = (
+        estimate_tokens(system_prompt)
+        + estimate_tokens(user_prompt)
+        + max_output_tokens
+    )
+    if estimated > SAFE_REQUEST_TOKEN_CEILING:
+        raise ValueError(
+            f"Prompt too large: estimated {estimated} tokens exceeds "
+            f"safe ceiling {SAFE_REQUEST_TOKEN_CEILING}. Reduce context "
+            f"before calling the model."
+        )
+    return estimated
 
 
 def call_groq_json(
@@ -263,13 +170,8 @@ def call_groq_json(
     user_prompt: str,
     max_output_tokens: int,
 ) -> Dict[str, Any]:
-    """
-    Call Groq and parse the response as JSON.
+    preflight_check(system_prompt, user_prompt, max_output_tokens)
 
-    Rate-limit and temporary API failures cause fallback to the next key.
-    Invalid JSON is not retried because it indicates an output-format problem,
-    not a key problem.
-    """
     last_error: Exception | None = None
 
     for key_index, client in key_pool.clients_in_order():
@@ -277,25 +179,16 @@ def call_groq_json(
             response = client.chat.completions.create(
                 model=model,
                 messages=[
-                    {
-                        "role": "system",
-                        "content": system_prompt,
-                    },
-                    {
-                        "role": "user",
-                        "content": user_prompt,
-                    },
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt},
                 ],
                 temperature=0,
                 max_tokens=max_output_tokens,
                 response_format={"type": "json_object"},
             )
-
             content = response.choices[0].message.content
-
             if not content:
                 raise RuntimeError("Groq returned an empty response.")
-
             result = json.loads(content)
             key_pool.mark_success(key_index)
             return result
@@ -308,12 +201,10 @@ def call_groq_json(
 
         except APIStatusError as error:
             last_error = error
-
-            if error.status_code in {401, 429, 500, 502, 503, 504}:
+            if error.status_code in {401, 413, 429, 500, 502, 503, 504}:
                 key_pool.rotate_after_failure(key_index)
                 time.sleep(1)
                 continue
-
             raise
 
         except APIError as error:
@@ -323,14 +214,9 @@ def call_groq_json(
             continue
 
         except json.JSONDecodeError as error:
-            raise RuntimeError(
-                "Groq returned invalid JSON. "
-                "The response did not follow the required schema."
-            ) from error
+            raise RuntimeError("Groq returned invalid JSON.") from error
 
-    raise RuntimeError(
-        f"All Groq API keys failed. Last error: {last_error}"
-    )
+    raise RuntimeError(f"All Groq API keys failed. Last error: {last_error}")
 
 
 def run_reviewer_pass(
@@ -340,56 +226,23 @@ def run_reviewer_pass(
     context_text: str,
     static_analysis_report: str,
 ) -> Dict[str, Any]:
-    """Run the first-pass rubric-based review."""
-    category_list = "\n".join(
-        (
-            f"- {name}: weight={config['weight']}, "
-            f"focus={config['description'].strip()}"
-        )
-        for name, config in rubric["categories"].items()
+    user_prompt = (
+        f"## Rubric\n{render_rubric_compact(rubric)}\n\n"
+        f"## Static analysis\n{static_analysis_report}\n\n"
+        f"## Code context\n{context_text}"
     )
-
-    user_prompt = f"""
-## Review rubric
-
-{category_list}
-
-## Static-analysis output
-
-{static_analysis_report}
-
-## Code context
-
-{context_text}
-
-Evaluate the pull request strictly against the listed rubric categories.
-Return every rubric category, even when its findings list is empty.
-"""
-
     return call_groq_json(
-        key_pool=key_pool,
-        model=model,
-        system_prompt=REVIEWER_SYSTEM_PROMPT,
-        user_prompt=user_prompt,
-        max_output_tokens=REVIEW_MAX_OUTPUT_TOKENS,
+        key_pool, model, REVIEWER_SYSTEM_PROMPT, user_prompt, REVIEW_MAX_OUTPUT_TOKENS
     )
 
 
-def collect_findings(
-    reviewer_output: Dict[str, Any],
-) -> List[Dict[str, Any]]:
-    """Flatten category findings and attach their category names."""
-    findings: List[Dict[str, Any]] = []
-
-    for category_name, category_data in reviewer_output.get(
-        "categories",
-        {},
-    ).items():
+def collect_findings(reviewer_output: Dict[str, Any]) -> List[Dict[str, Any]]:
+    findings = []
+    for category_name, category_data in reviewer_output.get("categories", {}).items():
         for finding in category_data.get("findings", []):
-            normalized_finding = dict(finding)
-            normalized_finding["category"] = category_name
-            findings.append(normalized_finding)
-
+            f = dict(finding)
+            f["category"] = category_name
+            findings.append(f)
     return findings
 
 
@@ -399,64 +252,32 @@ def run_verifier_pass(
     context_text: str,
     reviewer_output: Dict[str, Any],
 ) -> List[Dict[str, Any]]:
-    """Verify first-pass findings and remove discarded findings."""
     findings = collect_findings(reviewer_output)
-
     if not findings:
         return []
 
-    user_prompt = f"""
-## Original code context
-
-{context_text}
-
-## Findings to verify
-
-{json.dumps(findings, indent=2)}
-"""
-
-    verifier_output = call_groq_json(
-        key_pool=key_pool,
-        model=model,
-        system_prompt=VERIFIER_SYSTEM_PROMPT,
-        user_prompt=user_prompt,
-        max_output_tokens=VERIFIER_MAX_OUTPUT_TOKENS,
+    user_prompt = (
+        f"## Code context\n{context_text}\n\n"
+        f"## Findings to verify\n{json.dumps(findings)}"
     )
 
-    verified_findings = verifier_output.get(
-        "verified_findings",
-        [],
+    result = call_groq_json(
+        key_pool, model, VERIFIER_SYSTEM_PROMPT, user_prompt, VERIFIER_MAX_OUTPUT_TOKENS
     )
 
-    category_lookup: Dict[Tuple[str, str], str] = {
-        (
-            finding.get("file", ""),
-            finding.get("title", ""),
-        ): finding.get("category", "unknown")
-        for finding in findings
+    verified = result.get("verified_findings", [])
+    lookup: Dict[Tuple[str, str], str] = {
+        (f.get("file", ""), f.get("title", "")): f.get("category", "unknown")
+        for f in findings
     }
 
-    final_findings: List[Dict[str, Any]] = []
-
-    for finding in verified_findings:
-        status = finding.get("verification_status")
-
-        if status == "discarded":
+    final = []
+    for v in verified:
+        if v.get("verification_status") == "discarded":
             continue
-
-        lookup_key = (
-            finding.get("file", ""),
-            finding.get("title", ""),
-        )
-
-        finding["category"] = category_lookup.get(
-            lookup_key,
-            "unknown",
-        )
-
-        final_findings.append(finding)
-
-    return final_findings
+        v["category"] = lookup.get((v.get("file", ""), v.get("title", "")), "unknown")
+        final.append(v)
+    return final
 
 
 def review_pull_request(
@@ -465,49 +286,25 @@ def review_pull_request(
     context_text: str,
     model: str = DEFAULT_MODEL,
 ) -> Dict[str, Any]:
-    """
-    Execute the complete two-pass review pipeline.
-
-    The resulting dictionary is passed to decision_engine.py.
-    """
     rubric = load_rubric()
     key_pool = GroqKeyPool()
 
-    static_analysis_report = run_static_analysis(
-        repo_root=repo_root,
-        changed_files=changed_files,
-    )
+    static_analysis_report = run_static_analysis(repo_root, changed_files)
 
     reviewer_output = run_reviewer_pass(
-        key_pool=key_pool,
-        model=model,
-        rubric=rubric,
-        context_text=context_text,
-        static_analysis_report=static_analysis_report,
+        key_pool, model, rubric, context_text, static_analysis_report
     )
-
-    verified_findings = run_verifier_pass(
-        key_pool=key_pool,
-        model=model,
-        context_text=context_text,
-        reviewer_output=reviewer_output,
-    )
+    verified_findings = run_verifier_pass(key_pool, model, context_text, reviewer_output)
 
     category_scores = {
-        category_name: category_data.get("score", 0)
-        for category_name, category_data in reviewer_output.get(
-            "categories",
-            {},
-        ).items()
+        name: data.get("score", 0)
+        for name, data in reviewer_output.get("categories", {}).items()
     }
 
     return {
         "rubric": rubric,
         "category_scores": category_scores,
         "verified_findings": verified_findings,
-        "overall_summary": reviewer_output.get(
-            "overall_summary",
-            "",
-        ),
+        "overall_summary": reviewer_output.get("overall_summary", ""),
         "static_analysis_report": static_analysis_report,
     }
