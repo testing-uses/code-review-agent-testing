@@ -20,7 +20,7 @@ def main():
     store = LibraryStore()
 
     while True:
-        print(MENU)
+        print(MENU, ":")
         choice = input("Choose an option: ").strip()
 
         if choice == "1":
