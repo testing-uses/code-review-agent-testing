@@ -41,12 +41,16 @@ class LibraryStore:
             return None
         book.available_copies -= 1
         member.borrowed_isbns.append(isbn)
-        loan = Loan(
+        try:
+            loan = Loan(
             isbn=isbn,
             member_id=member_id,
             borrowed_on=date.today(),
             due_date=date.today() + timedelta(days=LOAN_PERIOD_DAYS),
         )
+        except Exception as e:
+            print(e)
+        
         self.loans.append(loan)
         return loan
 
