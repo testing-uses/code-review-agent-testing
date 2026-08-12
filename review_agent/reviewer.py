@@ -166,6 +166,48 @@ MEDIUM:
 LOW:
     Minor maintainability or documentation issue.
 
+SCORING RULES (follow these exactly — do not deviate):
+
+Each category's score depends ONLY on findings that belong to THAT
+category. A finding in one category must never lower the score of a
+different category. Categories are scored completely independently
+of each other.
+
+Use these fixed anchors for each category's score, based on the single
+worst finding reported within that category:
+
+- No findings in this category            -> score = 100
+- Worst finding in this category is LOW    -> score between 90 and 99
+- Worst finding in this category is MEDIUM -> score between 70 and 89
+- Worst finding in this category is HIGH   -> score between 40 and 69
+- Worst finding in this category is CRITICAL -> score between 0 and 39
+
+Never assign 0 to a category unless that specific category contains a
+CRITICAL finding. Never assign the same low score to every category just
+because one category has a problem. A clean category with zero findings
+must always score 100 — not 0, not "pending", not left unscored.
+
+Every one of the 8 rubric categories must appear in your JSON output,
+even if its findings list is empty and its score is 100.
+
+WORKED EXAMPLE (follow this exact pattern of independent scoring):
+
+If the diff has one HIGH bug in a function and one LOW trailing-whitespace
+issue in an unrelated file, the correct output assigns:
+  "correctness": {"score": 55, "findings": [the HIGH bug]}
+  "maintainability_and_style": {"score": 95, "findings": [the LOW whitespace issue]}
+  "security": {"score": 100, "findings": []}
+  "error_handling": {"score": 100, "findings": []}
+  "documentation": {"score": 100, "findings": []}
+  "performance_and_resources": {"score": 100, "findings": []}
+  "backward_compatibility": {"score": 100, "findings": []}
+  "architecture_consistency": {"score": 100, "findings": []}
+
+Notice that only "correctness" and "maintainability_and_style" are
+affected. The other six categories remain at 100 because they have no
+findings. This is the ONLY correct pattern. Do not lower unrelated
+categories.
+
 Return only valid JSON:
 
 {
@@ -186,6 +228,7 @@ Return only valid JSON:
   },
   "overall_summary": "Two or three sentence summary"
 }
+
 """
 
 VERIFIER_SYSTEM_PROMPT = """
