@@ -42,11 +42,12 @@ class LibraryStore:
         book.available_copies -= 1
         member.borrowed_isbns.append(isbn)
         loan = Loan(
-            isbn=isbn,
-            member_id=member_id,
-            borrowed_on=date.today(),
-            due_date=date.today() + timedelta(days=LOAN_PERIOD_DAYS),
+        isbn=isbn,
+        member_id=member_id,
+        borrowed_on=date.today(),
+        due_date=date.today() + timedelta(days=LOAN_PERIOD_DAYS),
         )
+        
         self.loans.append(loan)
         return loan
 
