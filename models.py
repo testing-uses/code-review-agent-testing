@@ -11,7 +11,7 @@ from typing import Optional
 @dataclass
 class Book:
     isbn: str
-    title: str 
+    title: str
     author: str
     total_copies: int
     available_copies: int
