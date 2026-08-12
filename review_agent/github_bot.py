@@ -10,7 +10,7 @@ to Bitbucket Pipelines later means rewriting just this file
 
 import os
 from typing import Any, Dict
-
+import subprocess
 from github import Github
 
 AUTO_APPROVE_LABEL = "agent-approved"
@@ -54,6 +54,51 @@ def render_comment(decision, review_result: Dict[str, Any]) -> str:
     )
     return "\n".join(lines)
 
+def enable_github_auto_merge(
+    repo_full_name: str,
+    pr_number: int,
+) -> None:
+    """
+    Queue GitHub native auto-merge.
+
+    GitHub will merge the PR after required checks and repository rules
+    are satisfied.
+    """
+    environment = os.environ.copy()
+    environment["GH_TOKEN"] = os.environ["GITHUB_TOKEN"]
+
+    command = [
+        "gh",
+        "pr",
+        "merge",
+        str(pr_number),
+        "--repo",
+        repo_full_name,
+        "--auto",
+        "--squash",
+    ]
+
+    result = subprocess.run(
+        command,
+        capture_output=True,
+        text=True,
+        env=environment,
+        check=False,
+    )
+
+    print(f"gh pr merge exit code: {result.returncode}")
+
+    if result.stdout:
+        print(result.stdout)
+
+    if result.stderr:
+        print(result.stderr)
+
+    if result.returncode != 0:
+        raise RuntimeError(
+            "Failed to enable GitHub auto-merge: "
+            f"{result.stderr or result.stdout}"
+        )
 
 def apply_decision(repo_full_name: str, pr_number: int, decision, review_result: Dict[str, Any]) -> None:
     gh = Github(os.environ["GITHUB_TOKEN"])
@@ -65,38 +110,31 @@ def apply_decision(repo_full_name: str, pr_number: int, decision, review_result:
 
     if decision.action == "AUTO_APPROVE":
         print("Decision is AUTO_APPROVE.")
-        print("Creating approval review...")
-
-        pr.create_review(
-            event="APPROVE",
-            body="Auto-approved by review agent.",
-        )
 
         pr.add_to_labels(AUTO_APPROVE_LABEL)
 
-        print("Attempting to merge pull request...")
-
-        merge_result = pr.merge(
-            merge_method="squash",
+        enable_github_auto_merge(
+            repo_full_name=repo_full_name,
+            pr_number=pr_number,
         )
 
-        print(f"Merge result: merged={merge_result.merged}")
-        print(f"Merge message: {merge_result.message}")
-
-        if not merge_result.merged:
-            raise RuntimeError(
-                f"GitHub did not merge the pull request: "
-                f"{merge_result.message}"
-            )
-
     elif decision.action == "HUMAN_REVIEW":
+        print("Decision is HUMAN_REVIEW.")
+
         pr.add_to_labels(HUMAN_REVIEW_LABEL)
-        # Intentionally does not merge or request changes — a human decides next.
 
     elif decision.action == "REJECT":
+        print("Decision is REJECT.")
+
         pr.add_to_labels(REJECTED_LABEL)
-        pr.create_review(event="REQUEST_CHANGES", body="Rejected by review agent. See reasons above.")
+
+        pr.create_issue_comment(
+            "Rejected by review agent. See reasons above."
+        )
+
         pr.edit(state="closed")
 
     else:
-        raise ValueError(f"Unknown decision action: {decision.action}")
+        raise ValueError(
+            f"Unknown decision action: {decision.action}"
+        )
