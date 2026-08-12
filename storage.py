@@ -48,7 +48,7 @@ class LibraryStore:
         due_date=date.today() + timedelta(days=LOAN_PERIOD_DAYS),
         ) 
         
-        self.loans.append(loan)
+        self.loans.append(loan) 
         return loan
 
     def return_book(self, isbn: str, member_id: str) -> bool:
