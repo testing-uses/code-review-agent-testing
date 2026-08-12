@@ -2,7 +2,10 @@ name: Custom LLM Code Review Agent
 
 on:
   pull_request:
-    types: [opened, synchronize, reopened]
+    types:
+      - opened
+      - synchronize
+      - reopened
 
 permissions:
   contents: write
@@ -14,7 +17,7 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout repository (full history for diffing)
+      - name: Checkout repository
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
@@ -26,11 +29,14 @@ jobs:
 
       - name: Install dependencies
         run: |
-          pip install openai pyyaml PyGithub ruff bandit
+          python -m pip install --upgrade pip
+          pip install groq pyyaml PyGithub ruff bandit
 
       - name: Run review agent
         env:
-          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          GROQ_API_KEY_1: ${{ secrets.GROQ_API_KEY_1 }}
+          GROQ_API_KEY_2: ${{ secrets.GROQ_API_KEY_2 }}
+          GROQ_API_KEY_3: ${{ secrets.GROQ_API_KEY_3 }}
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           python review_agent/run_review.py \
@@ -39,4 +45,4 @@ jobs:
             --head-sha "${{ github.event.pull_request.head.sha }}" \
             --repo-full-name "${{ github.repository }}" \
             --pr-number "${{ github.event.pull_request.number }}" \
-            --model gpt-4.1
+            --model llama-3.3-70b-versatile

@@ -27,7 +27,7 @@ class Member:
     borrowed_isbns: list = field(default_factory=list)
 
 
-@dataclass
+# @dataclass
 class Loan:
     isbn: str
     member_id: str

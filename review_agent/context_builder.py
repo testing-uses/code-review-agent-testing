@@ -1,103 +1,240 @@
 """
-review_agent/context_builder.py
+review_agent/context_builder.py  (v2 — token-optimized)
 
-Builds a token-budgeted, dependency-aware context package for the LLM.
-
-Strategy (priority order when the token budget is exceeded):
-  1. Full content of files actually changed in the PR.
-  2. Signature-only view (function/class signatures + docstrings) of files
-     that import, or are imported by, the changed files.
-  3. Diff-only fallback if even signatures don't fit.
-
-For files that are individually too large to fit even alone, the file is
-chunked by function/class boundaries and reviewed via map-reduce
-(see reviewer.py: review_large_file_chunks).
+Key changes from v1:
+  - No more sending full file content AND the diff. The diff (with a small
+    unified-context window) is the primary evidence. Full file content is
+    only included for brand-new files or files under a tiny line threshold,
+    where the diff already equals ~the whole file anyway.
+  - Dependency context is now SYMBOL-SELECTIVE: only signatures of functions
+    /classes actually referenced by identifiers in the changed lines are
+    included, not every signature in every locally-imported file. This uses
+    the cached repo map (repo_map.py) instead of re-parsing files every run.
+  - A real token budget is enforced end-to-end, with a hard ceiling well
+    below the model's per-minute limit, and priority-based degradation:
+        1. diff (always kept, trimmed if needed)
+        2. referenced symbol signatures (dropped first if over budget)
+        3. full content of new/tiny files (dropped second)
 """
 
-import ast
 import os
 import re
+import subprocess
 from dataclasses import dataclass, field
-from typing import Dict, List
+from typing import Dict, List, Set, Tuple
 
-CHARS_PER_TOKEN_ESTIMATE = 4  # rough heuristic, good enough for budgeting
+from repo_map import RepoMap, Symbol
 
+CHARS_PER_TOKEN_ESTIMATE = 3.3      # slightly conservative vs. 4, to avoid
+                                     # underestimating real token counts
+SAFETY_MARGIN = 1.15                # inflate estimates by 15% as a buffer
 
-@dataclass
-class ContextPackage:
-    changed_files: Dict[str, str] = field(default_factory=dict)
-    dependency_signatures: Dict[str, str] = field(default_factory=dict)
-    diff_text: str = ""
-    truncated: bool = False
-    notes: List[str] = field(default_factory=list)
+NEW_OR_TINY_FILE_LINE_THRESHOLD = 25
+DIFF_CONTEXT_LINES = 2               # git diff -U2 instead of default -U3
 
 
-def estimate_tokens(text: str) -> int:
-    return max(1, len(text) // CHARS_PER_TOKEN_ESTIMATE)
+import ast
 
 
-def extract_signatures(source: str) -> str:
-    """Return a signature-only view: function/class defs + docstrings, no bodies."""
+def get_file_at_ref(repo_root: str, ref: str, rel_path: str) -> str:
+    result = subprocess.run(
+        ["git", "show", f"{ref}:{rel_path}"],
+        cwd=repo_root, capture_output=True, text=True,
+    )
+    return result.stdout if result.returncode == 0 else ""
+
+
+def extract_top_level_names(source: str) -> Set[str]:
     try:
         tree = ast.parse(source)
     except SyntaxError:
-        return "# (unparsable file, signatures unavailable)"
-
-    lines = []
+        return set()
+    names = set()
     for node in ast.walk(tree):
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-            args = ", ".join(a.arg for a in node.args.args)
-            lines.append(f"def {node.name}({args}): ...")
-            doc = ast.get_docstring(node)
-            if doc:
-                lines.append(f'    """{doc.strip()}"""')
-        elif isinstance(node, ast.ClassDef):
-            lines.append(f"class {node.name}:")
-            doc = ast.get_docstring(node)
-            if doc:
-                lines.append(f'    """{doc.strip()}"""')
-    return "\n".join(lines) if lines else "# (no top-level defs found)"
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            names.add(node.name)
+    return names
 
 
-def find_local_dependencies(changed_files: List[str], repo_root: str) -> List[str]:
-    """
-    Very small dependency resolver for a flat-module POC repo:
-    looks for `import X` / `from X import` referencing other local .py files.
-    Replace with a proper import graph (e.g. via `modulegraph`) for larger repos.
-    """
-    local_modules = {
-        os.path.splitext(f)[0]
-        for f in os.listdir(repo_root)
-        if f.endswith(".py")
-    }
-    deps = set()
-    import_re = re.compile(r"^\s*(?:from|import)\s+([a-zA-Z_][\w]*)")
+def find_removed_symbols(repo_root: str, rel_path: str, base_sha: str) -> Set[str]:
+    """Symbols defined at base_sha that no longer exist (or are now commented
+    out / deleted) in the current working tree version of the file."""
+    old_source = get_file_at_ref(repo_root, base_sha, rel_path)
+    full_path = os.path.join(repo_root, rel_path)
+    new_source = ""
+    if os.path.exists(full_path):
+        with open(full_path, "r", encoding="utf-8") as fh:
+            new_source = fh.read()
 
-    for changed in changed_files:
-        path = os.path.join(repo_root, changed)
-        if not os.path.exists(path):
+    old_names = extract_top_level_names(old_source)
+    new_names = extract_top_level_names(new_source)
+    return old_names - new_names
+
+
+def find_downstream_usages(repo_root: str, symbol_name: str, exclude_file: str) -> List[Tuple[str, str, str]]:
+    """Find other .py files in the repo that still reference a symbol that
+    was just removed from the changed file. This is the reverse-dependency
+    check the diff alone can never surface."""
+    result = subprocess.run(
+        ["git", "grep", "-n", "-w", symbol_name, "--", "*.py"],
+        cwd=repo_root, capture_output=True, text=True,
+    )
+    usages = []
+    for line in result.stdout.splitlines():
+        parts = line.split(":", 2)
+        if len(parts) < 3:
             continue
-        with open(path, "r", encoding="utf-8") as fh:
-            for line in fh:
-                match = import_re.match(line)
-                if match:
-                    mod = match.group(1)
-                    if mod in local_modules and f"{mod}.py" not in changed_files:
-                        deps.add(f"{mod}.py")
-    return sorted(deps)
+        path, line_number, content = parts
+        if path == exclude_file:
+            continue
+        usages.append((path, line_number, content.strip()))
+    return usages
+
+@dataclass
+class ContextPackage:
+    diff_text: str = ""
+    full_files: Dict[str, str] = field(default_factory=dict)
+    referenced_signatures: Dict[str, str] = field(default_factory=dict)
+    removed_symbols_with_usages: List[Tuple[str, str, List[Tuple[str, str, str]]]] = field(default_factory=list)
+    truncated: bool = False
+    notes: List[str] = field(default_factory=list)
+    estimated_tokens: int = 0
+
+
+def estimate_tokens(text: str) -> int:
+    return max(1, int((len(text) / CHARS_PER_TOKEN_ESTIMATE) * SAFETY_MARGIN))
+
+
+def get_narrow_diff(
+    repo_root: str,
+    base_sha: str,
+    head_sha: str,
+    changed_files: List[str],
+) -> str:
+    command = [
+        "git",
+        "diff",
+        f"-U{DIFF_CONTEXT_LINES}",
+        base_sha,
+        head_sha,
+        "--",
+        *changed_files,
+    ]
+
+    result = subprocess.run(
+        command,
+        cwd=repo_root,
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+
+    return result.stdout
+
+
+def extract_identifiers(diff_text: str) -> Set[str]:
+    """Pull plausible function/class/variable identifiers out of the added
+    and removed diff lines, so we know which symbols to look up in the repo
+    map. Deliberately simple regex — false positives just mean we look up a
+    symbol that doesn't exist, which is a no-op."""
+    identifiers = set()
+    identifier_pattern = re.compile(r"\b[a-zA-Z_][a-zA-Z0-9_]*\b")
+
+    for line in diff_text.splitlines():
+        if line.startswith(("+++", "---", "@@")):
+            continue
+        if line.startswith(("+", "-")):
+            identifiers.update(identifier_pattern.findall(line[1:]))
+
+    return identifiers
+
+
+def is_new_or_tiny(repo_root: str, rel_path: str, base_sha: str) -> bool:
+    """A file counts as 'new or tiny' if it didn't exist at base_sha, or it
+    has few enough lines that the diff already captures ~all of it."""
+    check = subprocess.run(
+        ["git", "cat-file", "-e", f"{base_sha}:{rel_path}"],
+        cwd=repo_root, capture_output=True,
+    )
+    is_new = check.returncode != 0
+
+    full_path = os.path.join(repo_root, rel_path)
+    if not os.path.exists(full_path):
+        return is_new
+
+    with open(full_path, "r", encoding="utf-8") as fh:
+        line_count = sum(1 for _ in fh)
+
+    return is_new or line_count <= NEW_OR_TINY_FILE_LINE_THRESHOLD
 
 
 def build_context(
     repo_root: str,
     changed_files: List[str],
-    diff_text: str,
-    max_tokens: int = 6000,
+    base_sha: str,
+    head_sha: str,
+    repo_map: RepoMap,
+    max_tokens: int = 3000,
 ) -> ContextPackage:
-    pkg = ContextPackage(diff_text=diff_text)
+    pkg = ContextPackage()
     budget = max_tokens
 
-    # Priority 1: full content of changed files
+    # Priority 1: the narrow diff — always kept.
+    diff_text = get_narrow_diff(
+    repo_root,
+    base_sha,
+    head_sha,
+    changed_files,
+    )
+    diff_cost = estimate_tokens(diff_text)
+
+    removed_symbols_report = []
     for rel_path in changed_files:
+        if not rel_path.endswith(".py"):
+            continue
+        removed = find_removed_symbols(repo_root, rel_path, base_sha)
+        for symbol in removed:
+            usages = find_downstream_usages(repo_root, symbol, rel_path)
+            if usages:
+                removed_symbols_report.append((symbol, rel_path, usages))
+
+    pkg.removed_symbols_with_usages = removed_symbols_report
+
+    if diff_cost > budget:
+        keep_chars = int(budget * CHARS_PER_TOKEN_ESTIMATE / SAFETY_MARGIN)
+        diff_text = diff_text[:keep_chars]
+        pkg.truncated = True
+        pkg.notes.append("Diff truncated to fit token budget")
+        diff_cost = estimate_tokens(diff_text)
+
+    pkg.diff_text = diff_text
+    budget -= diff_cost
+
+    # Priority 2: symbol-selective dependency signatures (skip files already
+    # in changed_files — those are covered by the diff/full content).
+    if budget > 0:
+        identifiers = extract_identifiers(diff_text)
+        referenced: List[Symbol] = repo_map.resolve_symbols(
+            identifiers, exclude_files=set(changed_files)
+        )
+        for symbol in referenced:
+            entry = f"{symbol.file}: {symbol.signature}"
+            cost = estimate_tokens(entry)
+            if cost > budget:
+                pkg.notes.append(f"Dropped symbol {symbol.name} (budget exceeded)")
+                pkg.truncated = True
+                continue
+            pkg.referenced_signatures[f"{symbol.file}:{symbol.name}"] = entry
+            budget -= cost
+
+    # Priority 3: full content of new/tiny changed files only.
+    for rel_path in changed_files:
+        if budget <= 0:
+            pkg.notes.append(f"{rel_path} full content dropped (out of budget)")
+            pkg.truncated = True
+            continue
+        if not is_new_or_tiny(repo_root, rel_path, base_sha):
+            continue
         full_path = os.path.join(repo_root, rel_path)
         if not os.path.exists(full_path):
             continue
@@ -105,53 +242,37 @@ def build_context(
             content = fh.read()
         cost = estimate_tokens(content)
         if cost <= budget:
-            pkg.changed_files[rel_path] = content
+            pkg.full_files[rel_path] = content
             budget -= cost
         else:
-            pkg.changed_files[rel_path] = content[: budget * CHARS_PER_TOKEN_ESTIMATE]
-            pkg.truncated = True
-            pkg.notes.append(f"{rel_path} truncated to fit token budget")
-            budget = 0
-            break
-
-    # Priority 2: signature-only view of local dependencies
-    dep_files = find_local_dependencies(changed_files, repo_root)
-    for rel_path in dep_files:
-        if budget <= 0:
-            pkg.notes.append(f"{rel_path} dropped (out of budget)")
-            pkg.truncated = True
-            continue
-        full_path = os.path.join(repo_root, rel_path)
-        with open(full_path, "r", encoding="utf-8") as fh:
-            content = fh.read()
-        sig = extract_signatures(content)
-        cost = estimate_tokens(sig)
-        if cost <= budget:
-            pkg.dependency_signatures[rel_path] = sig
-            budget -= cost
-        else:
-            pkg.notes.append(f"{rel_path} signatures dropped (exceeds remaining budget)")
+            pkg.notes.append(f"{rel_path} full content dropped (exceeds remaining budget)")
             pkg.truncated = True
 
+    pkg.estimated_tokens = max_tokens - budget
     return pkg
 
 
 def render_context_for_prompt(pkg: ContextPackage) -> str:
-    parts = ["## Diff\n```diff\n" + pkg.diff_text + "\n```"]
+    parts = [f"## Diff\n```diff\n{pkg.diff_text}\n```"]
 
-    if pkg.changed_files:
-        parts.append("## Full content of changed files")
-        for path, content in pkg.changed_files.items():
+    if pkg.full_files:
+        parts.append("## New / small files (full content)")
+        for path, content in pkg.full_files.items():
             parts.append(f"### {path}\n```python\n{content}\n```")
 
-    if pkg.dependency_signatures:
-        parts.append("## Related local modules (signatures only, for interface context)")
-        for path, sig in pkg.dependency_signatures.items():
-            parts.append(f"### {path} (signatures)\n```python\n{sig}\n```")
+    if pkg.removed_symbols_with_usages:
+        parts.append("## ⚠ BREAKING CHANGE WARNING — removed symbols still referenced elsewhere")
+        for symbol, source_file, usages in pkg.removed_symbols_with_usages:
+            parts.append(f"`{symbol}` was removed from `{source_file}` but is still used in:")
+            for path, line_number, content in usages:
+                parts.append(f"  - {path}:{line_number}: `{content}`")
+
+    if pkg.referenced_signatures:
+        parts.append("## Referenced symbols (signature only)")
+        for key, entry in pkg.referenced_signatures.items():
+            parts.append(f"- {entry}")
 
     if pkg.truncated:
-        parts.append(
-            "## Context notes\n" + "\n".join(f"- {n}" for n in pkg.notes)
-        )
+        parts.append("## Context notes\n" + "\n".join(f"- {n}" for n in pkg.notes))
 
     return "\n\n".join(parts)
