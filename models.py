@@ -27,15 +27,15 @@ class Member:
     borrowed_isbns: list = field(default_factory=list)
 
 
-# @dataclass
-# class Loan:
-#     isbn: str
-#     member_id: str
-#     borrowed_on: date
-#     due_date: date
-#     returned_on: Optional[date] = None
+@dataclass
+class Loan:
+    isbn: str
+    member_id: str
+    borrowed_on: date
+    due_date: date
+    returned_on: Optional[date] = None
 
-#     def is_overdue(self, today: date) -> bool:
-#         if self.returned_on is not None:
-#             return False
-#         return today > self.due_date
+    def is_overdue(self, today: date) -> bool:
+        if self.returned_on is not None:
+            return False
+        return today > self.due_date
