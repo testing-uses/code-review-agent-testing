@@ -346,23 +346,6 @@ def call_groq_json(
     raise RuntimeError(f"All Groq API keys failed. Last error: {last_error}")
 
 
-def run_reviewer_pass(
-    key_pool: GroqKeyPool,
-    model: str,
-    rubric: Dict[str, Any],
-    context_text: str,
-    static_analysis_report: str,
-) -> Dict[str, Any]:
-    user_prompt = (
-        f"## Rubric\n{render_rubric_compact(rubric)}\n\n"
-        f"## Static analysis\n{static_analysis_report}\n\n"
-        f"## Code context\n{context_text}"
-    )
-    return call_groq_json(
-        key_pool, model, REVIEWER_SYSTEM_PROMPT, user_prompt, REVIEW_MAX_OUTPUT_TOKENS
-    )
-
-
 def collect_findings(reviewer_output: Dict[str, Any]) -> List[Dict[str, Any]]:
     findings = []
     for category_name, category_data in reviewer_output.get("categories", {}).items():
@@ -424,8 +407,8 @@ def review_pull_request(
     verified_findings = run_verifier_pass(key_pool, model, context_text, reviewer_output)
 
     category_scores = {
-        name: data.get("score", 0)
-        for name, data in reviewer_output.get("categories", {}).items()
+    name: reviewer_output.get("categories", {}).get(name, {}).get("score", 100)
+    for name in rubric["categories"]
     }
 
     return {
