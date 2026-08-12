@@ -40,7 +40,6 @@ def get_changed_files(repo_root: str, base_sha: str, head_sha: str):
     )
     return [f for f in result.stdout.strip().splitlines() if f]
 
-
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--repo-root", default=".")
@@ -94,7 +93,24 @@ def main():
         model=args.model,
     )
 
-    decision = decide(review_result)
+    if context_pkg.removed_symbols_with_usages:
+        print("BREAKING CHANGE DETECTED: removed symbol still referenced elsewhere.")
+        for symbol, source_file, usages in context_pkg.removed_symbols_with_usages:
+            print(f"  {symbol} (removed from {source_file}) used in: "
+                f"{[u[0] for u in usages]}")
+
+        decision = decide(review_result)
+
+        if decision.action == "AUTO_APPROVE":
+            decision.action = "HUMAN_REVIEW"
+            decision.reasons.insert(
+                0,
+                "Overridden: a removed symbol is still referenced elsewhere in "
+                "the codebase (likely breaking change). Deterministic check, "
+                "not LLM-dependent.",
+            )
+    else:
+        decision = decide(review_result)
 
     print(json.dumps({
         "action": decision.action,

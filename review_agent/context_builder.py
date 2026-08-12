@@ -21,7 +21,7 @@ import os
 import re
 import subprocess
 from dataclasses import dataclass, field
-from typing import Dict, List, Set
+from typing import Dict, List, Set, Tuple
 
 from repo_map import RepoMap, Symbol
 
@@ -33,11 +33,69 @@ NEW_OR_TINY_FILE_LINE_THRESHOLD = 25
 DIFF_CONTEXT_LINES = 2               # git diff -U2 instead of default -U3
 
 
+import ast
+
+
+def get_file_at_ref(repo_root: str, ref: str, rel_path: str) -> str:
+    result = subprocess.run(
+        ["git", "show", f"{ref}:{rel_path}"],
+        cwd=repo_root, capture_output=True, text=True,
+    )
+    return result.stdout if result.returncode == 0 else ""
+
+
+def extract_top_level_names(source: str) -> Set[str]:
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        return set()
+    names = set()
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            names.add(node.name)
+    return names
+
+
+def find_removed_symbols(repo_root: str, rel_path: str, base_sha: str) -> Set[str]:
+    """Symbols defined at base_sha that no longer exist (or are now commented
+    out / deleted) in the current working tree version of the file."""
+    old_source = get_file_at_ref(repo_root, base_sha, rel_path)
+    full_path = os.path.join(repo_root, rel_path)
+    new_source = ""
+    if os.path.exists(full_path):
+        with open(full_path, "r", encoding="utf-8") as fh:
+            new_source = fh.read()
+
+    old_names = extract_top_level_names(old_source)
+    new_names = extract_top_level_names(new_source)
+    return old_names - new_names
+
+
+def find_downstream_usages(repo_root: str, symbol_name: str, exclude_file: str) -> List[Tuple[str, str, str]]:
+    """Find other .py files in the repo that still reference a symbol that
+    was just removed from the changed file. This is the reverse-dependency
+    check the diff alone can never surface."""
+    result = subprocess.run(
+        ["git", "grep", "-n", "-w", symbol_name, "--", "*.py"],
+        cwd=repo_root, capture_output=True, text=True,
+    )
+    usages = []
+    for line in result.stdout.splitlines():
+        parts = line.split(":", 2)
+        if len(parts) < 3:
+            continue
+        path, line_number, content = parts
+        if path == exclude_file:
+            continue
+        usages.append((path, line_number, content.strip()))
+    return usages
+
 @dataclass
 class ContextPackage:
     diff_text: str = ""
     full_files: Dict[str, str] = field(default_factory=dict)
     referenced_signatures: Dict[str, str] = field(default_factory=dict)
+    removed_symbols_with_usages: List[Tuple[str, str, List[Tuple[str, str, str]]]] = field(default_factory=list)
     truncated: bool = False
     notes: List[str] = field(default_factory=list)
     estimated_tokens: int = 0
@@ -130,6 +188,18 @@ def build_context(
     )
     diff_cost = estimate_tokens(diff_text)
 
+    removed_symbols_report = []
+    for rel_path in changed_files:
+        if not rel_path.endswith(".py"):
+            continue
+        removed = find_removed_symbols(repo_root, rel_path, base_sha)
+        for symbol in removed:
+            usages = find_downstream_usages(repo_root, symbol, rel_path)
+            if usages:
+                removed_symbols_report.append((symbol, rel_path, usages))
+
+    pkg.removed_symbols_with_usages = removed_symbols_report
+
     if diff_cost > budget:
         keep_chars = int(budget * CHARS_PER_TOKEN_ESTIMATE / SAFETY_MARGIN)
         diff_text = diff_text[:keep_chars]
@@ -189,6 +259,13 @@ def render_context_for_prompt(pkg: ContextPackage) -> str:
         parts.append("## New / small files (full content)")
         for path, content in pkg.full_files.items():
             parts.append(f"### {path}\n```python\n{content}\n```")
+
+    if pkg.removed_symbols_with_usages:
+        parts.append("## ⚠ BREAKING CHANGE WARNING — removed symbols still referenced elsewhere")
+        for symbol, source_file, usages in pkg.removed_symbols_with_usages:
+            parts.append(f"`{symbol}` was removed from `{source_file}` but is still used in:")
+            for path, line_number, content in usages:
+                parts.append(f"  - {path}:{line_number}: `{content}`")
 
     if pkg.referenced_signatures:
         parts.append("## Referenced symbols (signature only)")
