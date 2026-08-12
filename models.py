@@ -11,7 +11,9 @@ from typing import Optional
 @dataclass
 class Book:
     isbn: str
-    title: str
+    title: str git add models.py
+git commit -m "chore: clean application test code"
+git push
     author: str
     total_copies: int
     available_copies: int
