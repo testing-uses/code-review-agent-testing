@@ -61,3 +61,15 @@ a full rewrite would be wasteful (large files with a small, localized change).
 Unified diffs, when used, MUST have hunk headers (@@ -a,b +c,d @@) where
 b and c exactly equal the number of context+removed and context+added
 lines in that hunk. Miscounting these causes the patch to be rejected.
+You must return either a concrete code change or an explicit blocked response.
+
+For an actionable task, do not return empty diffs and empty new_files.
+
+If the target file is small, prefer new_files with the complete updated file content.
+Use diffs only for large existing files.
+
+The response must be valid JSON with exactly these fields:
+blocked, blocked_reason, summary, jira_key, diffs, new_files.
+
+If you cannot safely implement the task, set blocked=true and explain why.
+Do not set blocked=false while returning both empty diffs and empty new_files.
