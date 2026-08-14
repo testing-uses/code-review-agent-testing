@@ -1,0 +1,79 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>Agentic AI Pipeline</title>
+  <style>
+    body { font-family: system-ui, sans-serif; max-width: 720px; margin: 40px auto; padding: 0 16px; }
+    textarea { width: 100%; height: 160px; font-family: monospace; }
+    button { padding: 10px 20px; margin-top: 12px; cursor: pointer; }
+    #status { margin-top: 24px; }
+    .run { border: 1px solid #ddd; border-radius: 6px; padding: 10px; margin-bottom: 8px; }
+    .queued { color: #b8860b; }
+    .in_progress { color: #1e6fd9; }
+    .completed { color: #1a7a3c; }
+  </style>
+</head>
+<body>
+  <h1>Agentic AI Pipeline</h1>
+  <p>Submit a task. Dev Agent, Orchestrator, and Code Review Agent all run
+     inside GitHub Actions — this avoids any local/org network restriction
+     on reaching Groq.</p>
+
+  <textarea id="taskText" placeholder="Describe the task, e.g. 'Add a method to LibraryStore called list_overdue_members...'"></textarea>
+  <br />
+  <button onclick="submitTask()">Submit Task</button>
+
+  <div id="statusMessage"></div>
+  <div id="status"></div>
+
+  <script>
+    async function submitTask() {
+      const taskText = document.getElementById("taskText").value.trim();
+      const statusMessage = document.getElementById("statusMessage");
+
+      if (!taskText) {
+        statusMessage.textContent = "Please enter a task description.";
+        return;
+      }
+
+      statusMessage.textContent = "Dispatching workflow...";
+
+      const response = await fetch("/trigger", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ task_text: taskText }),
+      });
+
+      const result = await response.json();
+      if (response.ok) {
+        statusMessage.textContent = "Workflow dispatched. Polling status...";
+        pollStatus();
+      } else {
+        statusMessage.textContent = "Error: " + JSON.stringify(result.error);
+      }
+    }
+
+    async function pollStatus() {
+      const statusDiv = document.getElementById("status");
+      const response = await fetch("/runs");
+      const runs = await response.json();
+
+      statusDiv.innerHTML = runs.map(run => `
+        <div class="run">
+          <div class="${run.status}">Status: ${run.status} (${run.conclusion || "pending"})</div>
+          <div>Started: ${run.created_at}</div>
+          <a href="${run.html_url}" target="_blank">View on GitHub</a>
+        </div>
+      `).join("");
+
+      const stillRunning = runs.some(run => run.status !== "completed");
+      if (stillRunning) {
+        setTimeout(pollStatus, 5000);
+      }
+    }
+
+    setInterval(pollStatus, 8000);
+  </script>
+</body>
+</html>
