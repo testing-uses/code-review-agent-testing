@@ -52,3 +52,12 @@ Rules:
   those are the platform, not the application.
 - If you cannot produce a clean, minimal diff for a change, it is better to
   set `"blocked": true` with a clear reason than to guess at line numbers.
+
+For any file under ~150 lines, or any file you touch that already exists,
+prefer returning it in `new_files` with the COMPLETE updated file content,
+rather than in `diffs` as a unified diff. Only use `diffs` for files where
+a full rewrite would be wasteful (large files with a small, localized change).
+
+Unified diffs, when used, MUST have hunk headers (@@ -a,b +c,d @@) where
+b and c exactly equal the number of context+removed and context+added
+lines in that hunk. Miscounting these causes the patch to be rejected.
