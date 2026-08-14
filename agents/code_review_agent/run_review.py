@@ -9,11 +9,21 @@ import json
 import subprocess
 import sys
 
+import os
+import sys
+
+AGENT_DIR = os.path.dirname(os.path.abspath(__file__))
+
+if AGENT_DIR not in sys.path:
+    sys.path.insert(0, AGENT_DIR)
+
 from context_builder import build_context, render_context_for_prompt
 from decision_engine import decide
 from github_bot import apply_decision
 from repo_map import RepoMap
 from reviewer import review_pull_request
+
+
 
 IGNORED_PATH_PREFIXES = (
     "review_agent/",
