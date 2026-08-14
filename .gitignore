@@ -1,3 +1,7 @@
-.review_agent_cache/
+.env
 __pycache__/
 *.pyc
+token_usage.txt
+.review_agent_cache/
+agents/knowledge_base/kb.sqlite3
+agents/orchestrator/metrics.jsonl
