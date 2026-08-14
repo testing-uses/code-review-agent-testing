@@ -31,7 +31,7 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install groq pyyaml PyGithub ruff bandit
+          pip install groq pyyaml PyGithub ruff bandit python-dotenv
 
       - name: Build/update knowledge base
         run: |
