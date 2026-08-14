@@ -1,70 +1,21 @@
-"""
-Legacy code (dummy, for POC purposes).
-Library Management System - interactive terminal entry point.
-"""
+from models import Loan
+import datetime
 
-from storage import LibraryStore
+def get_overdue_loans(loans):
+    return [loan for loan in loans if loan.is_overdue()]
 
-MENU = """
-1. Add book
-2. Register member
-3. Borrow book
-4. Return book
-5. List books
-6. Show overdue loans
-0. Exit
-"""
+def display_overdue_loans(loans):
+    overdue_loans = get_overdue_loans(loans)
+    if overdue_loans:
+        print('Overdue loans:')
+        for loan in overdue_loans:
+            print(f'ID: {loan.id}, Borrower: {loan.borrower}, Due Date: {loan.due_date}')
+    else:
+        print('No overdue loans.')
 
-
-def main():
-    store = LibraryStore()
-
-    while True:
-        print(MENU)
-        choice = input("Choose an option: ").strip()
-
-        if choice == "1":
-            isbn = input("ISBN: ").strip()
-            title = input("Title: ").strip()
-            author = input("Author: ").strip()
-            copies = int(input("Copies: ").strip())
-            store.add_book(isbn, title, author, copies)
-            print("Book added.")
-
-        elif choice == "2":
-            member_id = input("Member ID: ").strip()
-            name = input("Name: ").strip()
-            store.register_member(member_id, name)
-            print("Member registered.")
-
-        elif choice == "3":
-            isbn = input("ISBN: ").strip()
-            member_id = input("Member ID: ").strip()
-            loan = store.borrow_book(isbn, member_id)
-            print("Borrowed." if loan else "Could not borrow book.")
-
-        elif choice == "4":
-            isbn = input("ISBN: ").strip()
-            member_id = input("Member ID: ").strip()
-            ok = store.return_book(isbn, member_id)
-            print("Returned." if ok else "No matching active loan found.")
-
-        elif choice == "5":
-            for book in store.list_books():
-                print(f"{book.isbn} | {book.title} | {book.author} | "
-                      f"{book.available_copies}/{book.total_copies} available")
-
-        elif choice == "6":
-            for loan in store.overdue_loans():
-                print(f"{loan.isbn} borrowed by {loan.member_id}, due {loan.due_date}")
-
-        elif choice == "0":
-            print("Goodbye.")
-            break
-
-        else:
-            print("Invalid option.")
-
-
-if __name__ == "__main__":
-    main() 
+# Example usage:
+loans = [
+    Loan(1, 'John Doe', datetime.date(2022, 9, 1)),
+    Loan(2, 'Jane Doe', datetime.date(2024, 9, 16))
+]
+display_overdue_loans(loans)

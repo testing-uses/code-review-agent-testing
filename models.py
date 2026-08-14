@@ -1,41 +1,10 @@
-"""
-Legacy code (dummy, for POC purposes).
-Library Management System - domain models.
-"""
+from datetime import datetime
 
-from dataclasses import dataclass, field
-from datetime import date
-from typing import Optional
-
-
-@dataclass
-class Book:
-    isbn: str
-    title: str
-    author: str
-    total_copies: int
-    available_copies: int
-
-    def is_available(self) -> bool:
-        return self.available_copies > 0
-
-
-@dataclass
-class Member:
-    member_id: str
-    name: str
-    borrowed_isbns: list = field(default_factory=list)
-
-
-# @dataclass
 class Loan:
-    isbn: str
-    member_id: str
-    borrowed_on: date
-    due_date: date
-    returned_on: Optional[date] = None
+    def __init__(self, id, borrower, due_date):
+        self.id = id
+        self.borrower = borrower
+        self.due_date = due_date
 
-    def is_overdue(self, today: date) -> bool:
-        if self.returned_on is not None:
-            return False
-        return today > self.due_date
+    def is_overdue(self):
+        return self.due_date < datetime.now()
