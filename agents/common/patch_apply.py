@@ -1,23 +1,29 @@
 """
-agents/common/patch_apply.py
+agents/common/patch_apply.py (v2 — resilient + debuggable)
 
-The deterministic mechanism the Dev Agent uses to "edit" a file. The LLM
-never executes anything itself — it only produces text, which this module
-applies:
-
-    New file       -> write_full_file(): plain file write.
-    Existing file  -> apply_unified_diff(): `git apply` on an LLM-produced
-                       unified diff. This fails loudly (non-zero exit,
-                       captured stderr) instead of silently corrupting the
-                       file if the diff doesn't cleanly match — which is
-                       exactly the auditability you want from an agent that
-                       edits code unsupervised.
+Changes from v1:
+- Tries multiple `git apply` strategies before giving up, because LLM-
+  generated unified diffs frequently have correct content but slightly
+  wrong hunk-header line counts (`@@ -a,b +c,d @@`). `--recount` tells
+  git to ignore the header counts and recompute them from the actual
+  hunk body, which fixes the single most common LLM diff failure mode.
+- On total failure, the raw diff text (truncated) is included in the
+  returned message, so the orchestrator's BLOCKED reason actually shows
+  what the model produced instead of just git's opaque stderr.
 """
 
 import os
 import subprocess
 import tempfile
 from typing import Tuple
+
+DIFF_SNIPPET_MAX_CHARS = 1200
+
+APPLY_STRATEGIES = [
+    ["git", "apply", "--whitespace=fix", "--recount"],
+    ["git", "apply", "--whitespace=fix", "--recount", "--unidiff-zero"],
+    ["git", "apply", "--whitespace=fix", "--recount", "--ignore-space-change", "--ignore-whitespace"],
+]
 
 
 def write_full_file(repo_root: str, rel_path: str, content: str) -> None:
@@ -27,21 +33,38 @@ def write_full_file(repo_root: str, rel_path: str, content: str) -> None:
         fh.write(content)
 
 
+def _snippet(diff_text: str) -> str:
+    if len(diff_text) <= DIFF_SNIPPET_MAX_CHARS:
+        return diff_text
+    return diff_text[:DIFF_SNIPPET_MAX_CHARS] + "\n...[truncated]..."
+
+
 def apply_unified_diff(repo_root: str, diff_text: str) -> Tuple[bool, str]:
-    """Applies a unified diff via `git apply`. Returns (success, message)."""
+    """Applies a unified diff via `git apply`, trying progressively more
+    lenient strategies. Returns (success, message). On failure, message
+    includes both git's stderr AND a snippet of the raw diff so failures
+    are actually debuggable instead of just 'corrupt patch at line N'."""
     with tempfile.NamedTemporaryFile(
         mode="w", suffix=".diff", delete=False, encoding="utf-8"
     ) as tmp_file:
         tmp_file.write(diff_text)
         tmp_path = tmp_file.name
 
+    errors = []
     try:
-        result = subprocess.run(
-            ["git", "apply", "--whitespace=fix", tmp_path],
-            cwd=repo_root, capture_output=True, text=True,
+        for strategy in APPLY_STRATEGIES:
+            result = subprocess.run(
+                strategy + [tmp_path],
+                cwd=repo_root, capture_output=True, text=True,
+            )
+            if result.returncode == 0:
+                return True, f"Patch applied successfully (strategy: {' '.join(strategy)})."
+            errors.append(f"[{' '.join(strategy)}] {result.stderr.strip()}")
+
+        combined_errors = " | ".join(errors)
+        return False, (
+            f"git apply failed after {len(APPLY_STRATEGIES)} strategies: {combined_errors}\n"
+            f"--- raw diff received from model ---\n{_snippet(diff_text)}"
         )
-        if result.returncode == 0:
-            return True, "Patch applied successfully."
-        return False, f"git apply failed: {result.stderr.strip()}"
     finally:
         os.unlink(tmp_path)
