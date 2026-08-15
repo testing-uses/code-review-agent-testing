@@ -5,14 +5,19 @@ Read-side API of the central knowledge base, used by every agent
 (Dev Agent, Code Review Agent, future QA Agent) instead of each agent
 rebuilding its own context from scratch.
 
-Implements, in pure Python (no extra dependencies):
-    - reverse_dependencies(): the exact check that would have caught the
-      `Loan` removal bug deterministically.
-    - keyword_search(): cosine similarity over term-frequency vectors —
-      the lightweight stand-in for vector-DB semantic search.
-    - personalized_pagerank(): manual power-iteration PageRank seeded on
-      the files/symbols actually touched by the current task, matching
-      the same algorithm used by Aider's repo map.
+CHANGES in this version:
+  - personalized_pagerank(): fixed a dangling-node mass leak. Any node
+    with no outgoing edges (very common for leaf functions) was dropping
+    its rank each iteration instead of redistributing it, so total rank
+    mass shrank every round instead of staying conserved at 1.0 — this
+    was silently under-weighting anything mostly reached via leaf calls
+    in context_selector's fused relevance score. Standard PPR fix:
+    collect dangling mass, re-inject it through the personalization
+    vector each iteration.
+  - get_signatures_excluding(): added so context_builder.py can resolve
+    symbol signatures from THIS central KB instead of maintaining a
+    second, disconnected symbol cache (repo_map.py). One knowledge base,
+    shared by dev agent and review agent alike.
 """
 
 import json
@@ -47,6 +52,27 @@ def get_signatures(conn: sqlite3.Connection, names: List[str]) -> List[dict]:
         {"name": r[0], "file": r[1], "kind": r[2], "signature": r[3], "docstring": r[4]}
         for r in cursor.fetchall()
     ]
+
+
+def get_signatures_excluding(conn: sqlite3.Connection, names: Set[str], exclude_files: Set[str]) -> List[dict]:
+    """Same as get_signatures, but drops symbols defined in files already
+    covered elsewhere (e.g. already shown in full via the diff), and
+    de-duplicates by symbol name — the same job repo_map.resolve_symbols
+    used to do against its own separate cache. This is now the single
+    place both agents resolve "what does this identifier refer to"."""
+    if not names:
+        return []
+    results = get_signatures(conn, list(names))
+    seen = set()
+    filtered = []
+    for entry in results:
+        if entry["file"] in exclude_files:
+            continue
+        if entry["name"] in seen:
+            continue
+        seen.add(entry["name"])
+        filtered.append(entry)
+    return filtered
 
 
 def _cosine_similarity(vec_a: Dict[str, int], vec_b: Dict[str, int]) -> float:
@@ -95,8 +121,16 @@ def personalized_pagerank(
 ) -> Dict[str, float]:
     """Manual power-iteration PageRank over the symbol reference graph,
     personalized (restart-biased) toward the seed symbols — i.e. the files
-    actually being changed by the current task. Same algorithm family as
-    Aider's repo map ranking, implemented without a graph-library dependency."""
+    actually being changed by the current task.
+
+    Dangling-node fix: a node with no outgoing edges used to just drop its
+    rank on the floor each iteration (`if not out_links: continue`), which
+    leaks probability mass out of the system every round instead of
+    conserving it at 1.0. That systematically under-scores anything mostly
+    reached through leaf functions (getters, helpers with no further calls
+    — i.e. a lot of real code). Fix: collect the dangling mass each round
+    and redistribute it via the personalization vector, same as standard
+    personalized PageRank / topic-sensitive PageRank formulations."""
     cursor = conn.cursor()
     cursor.execute("SELECT src_symbol, dst_symbol FROM edges")
     edges = cursor.fetchall()
@@ -117,9 +151,16 @@ def personalized_pagerank(
     personalization = {node: weight / total_seed_weight for node, weight in personalization.items()}
 
     rank = {node: 1.0 / len(nodes) for node in nodes}
+    dangling_nodes = [node for node in nodes if not outgoing.get(node)]
 
     for _ in range(iterations):
-        new_rank = {node: (1 - damping) * personalization.get(node, 0.0) for node in nodes}
+        dangling_mass = damping * sum(rank[node] for node in dangling_nodes)
+
+        new_rank = {
+            node: (1 - damping) * personalization.get(node, 0.0)
+                  + dangling_mass * personalization.get(node, 0.0)
+            for node in nodes
+        }
         for node in nodes:
             out_links = outgoing.get(node, [])
             if not out_links:

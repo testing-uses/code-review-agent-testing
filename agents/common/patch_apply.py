@@ -27,7 +27,7 @@ APPLY_STRATEGIES = [
 
 
 def write_full_file(repo_root: str, rel_path: str, content: str) -> None:
-    full_path = os.path.join(repo_root, rel_path)
+    full_path = _resolve_within_repo(repo_root, rel_path)
     os.makedirs(os.path.dirname(full_path) or ".", exist_ok=True)
     with open(full_path, "w", encoding="utf-8") as fh:
         fh.write(content)
