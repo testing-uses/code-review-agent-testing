@@ -1,11 +1,17 @@
 """
-review_agent/github_bot.py
+review_agent/github_bot.py  (v2)
 
-The ONLY Git-provider-specific module. Everything upstream of this
-(context building, reviewing, deciding) is provider-agnostic and works
-directly on diffs and file contents, so migrating this POC from GitHub
-to Bitbucket Pipelines later means rewriting just this file
-(swap PyGithub calls for Bitbucket REST API / Pipelines API calls).
+CHANGE: AUTO_APPROVE used to call enable_github_auto_merge(), which
+queues `gh pr merge --auto` — the agent merging without any human step.
+That directly contradicts the epic doc: "Human Approval: Maintains
+human control over final approval and prevents autonomous agents from
+independently merging pull requests." AUTO_APPROVE now only labels +
+comments (fast lane signal for the human), same as before minus the
+actual merge. If you deliberately want opt-in auto-merge later, gate it
+behind an explicit env var/flag at the call site — don't make it the
+decision engine's default behavior.
+
+Everything else (labels, comment rendering) unchanged.
 """
 
 import os
@@ -16,6 +22,10 @@ from github import Github
 AUTO_APPROVE_LABEL = "agent-approved"
 HUMAN_REVIEW_LABEL = "needs-human-review"
 REJECTED_LABEL = "agent-rejected"
+
+# Explicit opt-in only. Default is False so a fresh clone of this repo
+# never silently merges anything — matches "human maintains final approval".
+ALLOW_AUTONOMOUS_AUTO_MERGE = os.environ.get("ALLOW_AUTONOMOUS_AUTO_MERGE", "false").lower() == "true"
 
 
 def render_comment(decision, review_result: Dict[str, Any]) -> str:
@@ -48,11 +58,18 @@ def render_comment(decision, review_result: Dict[str, Any]) -> str:
     for reason in decision.reasons:
         lines.append(f"- {reason}")
 
+    if decision.action == "AUTO_APPROVE":
+        lines.append(
+            "\n*The agent found no blocking issues. A human still needs to "
+            "click merge — this pipeline does not merge autonomously.*"
+        )
+
     lines.append(
         "\n---\n*Generated automatically by the custom LLM review agent. "
         "This is a POC pipeline; treat REJECT/HUMAN_REVIEW as advisory until validated.*"
     )
     return "\n".join(lines)
+
 
 def enable_github_auto_merge(
     repo_full_name: str,
@@ -61,8 +78,9 @@ def enable_github_auto_merge(
     """
     Queue GitHub native auto-merge.
 
-    GitHub will merge the PR after required checks and repository rules
-    are satisfied.
+    Only called when ALLOW_AUTONOMOUS_AUTO_MERGE is explicitly set — see
+    module docstring. GitHub will still merge only after required checks
+    and repository rules are satisfied.
     """
     environment = os.environ.copy()
     environment["GH_TOKEN"] = os.environ["GITHUB_TOKEN"]
@@ -100,6 +118,7 @@ def enable_github_auto_merge(
             f"{result.stderr or result.stdout}"
         )
 
+
 def apply_decision(repo_full_name: str, pr_number: int, decision, review_result: Dict[str, Any]) -> None:
     gh = Github(os.environ["GITHUB_TOKEN"])
     repo = gh.get_repo(repo_full_name)
@@ -113,10 +132,14 @@ def apply_decision(repo_full_name: str, pr_number: int, decision, review_result:
 
         pr.add_to_labels(AUTO_APPROVE_LABEL)
 
-        enable_github_auto_merge(
-            repo_full_name=repo_full_name,
-            pr_number=pr_number,
-        )
+        if ALLOW_AUTONOMOUS_AUTO_MERGE:
+            enable_github_auto_merge(
+                repo_full_name=repo_full_name,
+                pr_number=pr_number,
+            )
+        else:
+            print("ALLOW_AUTONOMOUS_AUTO_MERGE not set — skipping auto-merge, "
+                  "labeled for human merge instead.")
 
     elif decision.action == "HUMAN_REVIEW":
         print("Decision is HUMAN_REVIEW.")

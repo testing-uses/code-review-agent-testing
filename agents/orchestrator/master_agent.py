@@ -1,4 +1,16 @@
-"""agents/orchestrator/master_agent.py"""
+"""agents/orchestrator/master_agent.py  (v2)
+
+CHANGES from v1:
+  - review_result now read via its real key ("action": AUTO_APPROVE /
+    HUMAN_REVIEW / REJECT — decision_engine's actual vocabulary) instead
+    of a "status"/"PASS" pair that decision_engine never produces. That
+    mismatch meant CODE_REVIEW_PASSED was unreachable code before.
+  - The `except ImportError` around run_review_for_pr used to swallow a
+    real wiring bug and quietly continue to HUMAN_APPROVAL_REQUIRED as if
+    review had run. Now a failure to run review fails the workflow
+    closed (WORKFLOW_FAILED) with the real error surfaced, instead of
+    pretending review happened when it didn't.
+"""
 
 import argparse
 import json
@@ -120,6 +132,11 @@ def run_pipeline(
         dev_agent_tokens=budgets["dev_agent"],
         code_review_agent_tokens=budgets["code_review_agent"],
     )
+    # NOTE: review_signals above are static placeholders — the real diff
+    # size isn't known until AFTER the Dev Agent runs, so this budget
+    # split is only ever a rough guess for the review side. Not fixed
+    # here (needs a second DCBA pass post-diff); flagging so it doesn't
+    # get mistaken for a real complexity-based allocation.
 
     state = transition(state, WorkflowState.DEV_IN_PROGRESS)
     emit(
@@ -235,22 +252,35 @@ def run_pipeline(
             repo_full_name=repo_full_name,
             pr_number=pr_number,
             budget_tokens=budgets["code_review_agent"],
+            db_path=db_path,
         )
-    except ImportError:
-        review_result = {"status": "NOT_WIRED_YET"}
+        review_error = None
+    except Exception as error:  # was `except ImportError`, silently faking success
+        review_result = {"action": "ERROR"}
+        review_error = str(error)
 
     report["code_review_agent"] = review_result
-    decision_action = review_result.get("status")
-    emit("code_review_finished", status=decision_action, result=review_result)
+    decision_action = review_result.get("action")
+    emit("code_review_finished", action=decision_action, result=review_result, error=review_error)
 
-    if decision_action == "REJECT":
+    if review_error is not None:
+        # Fail closed: review genuinely did not run. Don't pretend it did
+        # by routing to HUMAN_APPROVAL_REQUIRED as if a review happened.
+        state = transition(state, WorkflowState.CODE_REVIEW_BLOCKED)
+        state = transition(state, WorkflowState.WORKFLOW_FAILED)
+        emit("workflow_failed", task_id=task_id, stage="code_review", reason=review_error)
+    elif decision_action == "REJECT":
         state = transition(state, WorkflowState.CODE_REVIEW_BLOCKED)
         state = transition(state, WorkflowState.WORKFLOW_FAILED)
         emit("workflow_failed", task_id=task_id, stage="code_review", reason="REJECT")
     else:
+        # AUTO_APPROVE or HUMAN_REVIEW both still land on a human gate —
+        # decision_engine's AUTO_APPROVE means "the agent thinks this is
+        # fine", not "skip the human". See github_bot.py fix: AUTO_APPROVE
+        # no longer triggers auto-merge on its own.
         target = (
             WorkflowState.CODE_REVIEW_PASSED
-            if decision_action == "PASS"
+            if decision_action == "AUTO_APPROVE"
             else WorkflowState.CODE_REVIEW_BLOCKED
         )
         state = transition(state, target)
