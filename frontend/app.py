@@ -1,8 +1,28 @@
+"""
+frontend/app.py
+
+Minimal Flask backend. The browser never sees a GitHub token -- this server
+holds it and calls the GitHub REST API to dispatch the workflow and to pull
+back live progress. LLM calls happen on the GitHub Actions runner, not on
+your machine or the browser.
+
+New in this version:
+- /status/<run_id> fetches the run, its jobs, and the job logs, then
+  parses out [PIPELINE] JSON lines emitted by agents/orchestrator/progress.py
+  so the frontend can render a real timeline instead of just a status blob.
+
+Run:
+    export GITHUB_DISPATCH_TOKEN=ghp_xxx   # PAT with 'repo' + 'workflow' scope
+    python frontend/app.py
+
+Then open http://localhost:5000
+"""
+
+import io
 import json
 import os
 import re
 import zipfile
-from io import BytesIO
 
 import requests
 from flask import Flask, jsonify, render_template, request
@@ -20,16 +40,8 @@ WORKFLOW_FILE = os.environ.get(
 GITHUB_API_BASE = "https://api.github.com"
 
 PIPELINE_PREFIX = "[PIPELINE] "
+PIPELINE_LINE_RE = re.compile(re.escape(PIPELINE_PREFIX) + r"(\{.*\})")
 
-
-def github_headers():
-    token = os.environ.get("GITHUB_DISPATCH_TOKEN")
-
-    if not token:
-        raise RuntimeError(
-            "GITHUB_DISPATCH_TOKEN is not configured. "
-            "Set it in PowerShell before starting Flask."
-        )
 
     return {
         "Authorization": f"Bearer {token}",
@@ -38,19 +50,8 @@ def github_headers():
     }
 
 
-def github_get(path, params=None):
-    response = requests.get(
-        f"{GITHUB_API_BASE}{path}",
-        headers=github_headers(),
-        params=params,
-        timeout=30,
-    )
-    return response
-
-
-@app.errorhandler(RuntimeError)
-def handle_runtime_error(error):
-    return jsonify({"error": str(error)}), 500
+def github_get(path: str, params: dict | None = None) -> requests.Response:
+    return requests.get(f"{GITHUB_API_BASE}{path}", headers=github_headers(), params=params)
 
 
 @app.route("/")
@@ -94,9 +95,8 @@ def trigger():
 def runs():
     response = github_get(
         f"/repos/{REPO_FULL_NAME}/actions/workflows/{WORKFLOW_FILE}/runs",
-        params={"per_page": 10},
+        params={"per_page": 5},
     )
-
     if response.status_code != 200:
         return jsonify({"error": response.text}), response.status_code
 
@@ -275,9 +275,78 @@ def status(run_id):
     })
 
 
+def _fetch_job_log_text(job_id: int) -> str:
+    """GitHub returns a redirect to a plaintext (sometimes gzip) log blob."""
+    url = f"{GITHUB_API_BASE}/repos/{REPO_FULL_NAME}/actions/jobs/{job_id}/logs"
+    response = requests.get(url, headers=github_headers(), allow_redirects=True)
+    if response.status_code != 200:
+        return ""
+    return response.text
+
+
+def _parse_pipeline_events(log_text: str) -> list[dict]:
+    events = []
+    for line in log_text.splitlines():
+        match = PIPELINE_LINE_RE.search(line)
+        if not match:
+            continue
+        try:
+            event = json.loads(match.group(1))
+        except json.JSONDecodeError:
+            continue
+        events.append(event)
+    return events
+
+
+def _dedupe_events(events: list[dict]) -> list[dict]:
+    seen = set()
+    unique = []
+    for event in events:
+        key = (event.get("event"), event.get("timestamp"), json.dumps(event, sort_keys=True, default=str))
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(event)
+    unique.sort(key=lambda e: e.get("timestamp", ""))
+    return unique
+
+
+@app.route("/status/<int:run_id>")
+def status(run_id):
+    run_response = github_get(f"/repos/{REPO_FULL_NAME}/actions/runs/{run_id}")
+    if run_response.status_code != 200:
+        return jsonify({"error": run_response.text}), run_response.status_code
+    run = run_response.json()
+
+    jobs_response = github_get(f"/repos/{REPO_FULL_NAME}/actions/runs/{run_id}/jobs")
+    jobs_data = jobs_response.json().get("jobs", []) if jobs_response.status_code == 200 else []
+
+    all_events = []
+    job_summaries = []
+    for job in jobs_data:
+        log_text = _fetch_job_log_text(job["id"])
+        all_events.extend(_parse_pipeline_events(log_text))
+        job_summaries.append({
+            "id": job["id"],
+            "name": job["name"],
+            "status": job["status"],
+            "conclusion": job["conclusion"],
+            "started_at": job.get("started_at"),
+            "completed_at": job.get("completed_at"),
+        })
+
+    return jsonify({
+        "run": {
+            "id": run["id"],
+            "status": run["status"],
+            "conclusion": run["conclusion"],
+            "html_url": run["html_url"],
+            "created_at": run["created_at"],
+        },
+        "jobs": job_summaries,
+        "events": _dedupe_events(all_events),
+    })
+
+
 if __name__ == "__main__":
-    app.run(
-        debug=True,
-        host="127.0.0.1",
-        port=5000,
-    )
+    app.run(debug=True, port=5000)
