@@ -1,30 +1,34 @@
 """
-agents/orchestrator/dcba.py
+agents/orchestrator/dcba.py  (v2 — two-phase allocation)
 
 Dynamic Context Budget Allocation (DCBA).
 
-Splits a fixed total token budget across agents by task complexity, using
-a softmax weighting of complexity scores (same formula family used in
-adaptive multi-agent attention/budget orchestration research):
+Phase 1 (unchanged): softmax-weighted split of the total budget across
+agents by complexity score, computed BEFORE the Dev Agent has run. This
+is necessarily a guess for the review agent's side — you don't know the
+diff size or whether it touches anything sensitive before it exists.
 
-    budget_i = TOTAL_BUDGET * exp(alpha_i) / sum(exp(alpha_j))
-
-This guarantees the allocated budgets always sum to the global ceiling —
-which is what prevents three concurrent-ish agents from independently
-exceeding the shared Groq account-level TPM limit, the exact failure mode
-that caused the original 413 error.
-
-An exponential moving average (EMA) of actual historical usage nudges
-future allocations toward what agents really consume, not just the
-complexity-score estimate.
+Phase 2 (NEW — reallocate_review_budget): once the Dev Agent has actually
+produced a diff, replace that guess with real signals — actual files/
+lines changed, whether the diff touches anything that looks security-
+sensitive — and cap the review agent's budget by what's ACTUALLY left of
+the shared ceiling after the Dev Agent's real usage, not its original
+estimate. This is what actually protects the shared Groq TPM limit;
+phase 1 alone only protects against two budgets that were both guesses.
 """
 
 import math
+import subprocess
 from dataclasses import dataclass
-from typing import Dict
+from typing import Dict, List, Optional
 
 MIN_BUDGET_PER_AGENT = 800
 DEFAULT_TOTAL_BUDGET = 9000  # keep comfortably under a 12,000 TPM ceiling
+
+SECURITY_SENSITIVE_HINTS = (
+    "auth", "secret", "password", "token", "crypto", "permission",
+    "security", "acl", "session", "credential", "login",
+)
 
 
 @dataclass
@@ -79,7 +83,7 @@ def allocate_budgets(
 
 def apply_ema_correction(
     raw_budget: int,
-    ema_actual_usage: float | None,
+    ema_actual_usage: Optional[float],
     correction_weight: float = 0.5,
 ) -> int:
     """Blend the complexity-based estimate with historical actual usage.
@@ -90,7 +94,71 @@ def apply_ema_correction(
     return int(round(corrected))
 
 
-def update_ema(previous_ema: float | None, latest_actual: int, alpha: float = 0.3) -> float:
+def update_ema(previous_ema: Optional[float], latest_actual: int, alpha: float = 0.3) -> float:
     if previous_ema is None:
         return float(latest_actual)
     return alpha * latest_actual + (1 - alpha) * previous_ema
+
+
+def diff_line_count(repo_root: str, base_sha: str, head_sha: str, changed_files: List[str]) -> int:
+    """Total added+removed lines across the reviewable diff — the real
+    'lines_changed' signal, vs. the hardcoded 20 the review agent's budget
+    used to be computed from."""
+    if not changed_files:
+        return 0
+    result = subprocess.run(
+        ["git", "diff", "--numstat", base_sha, head_sha, "--", *changed_files],
+        cwd=repo_root, capture_output=True, text=True,
+    )
+    total = 0
+    for line in result.stdout.splitlines():
+        parts = line.split("\t")
+        if len(parts) < 2:
+            continue
+        added, removed = parts[0], parts[1]
+        total += (int(added) if added.isdigit() else 0) + (int(removed) if removed.isdigit() else 0)
+    return total
+
+
+def looks_security_sensitive(changed_files: List[str]) -> bool:
+    return any(hint in f.lower() for f in changed_files for hint in SECURITY_SENSITIVE_HINTS)
+
+
+def reallocate_review_budget(
+    repo_root: str,
+    base_sha: str,
+    head_sha: str,
+    changed_files: List[str],
+    dev_actual_tokens_used: int,
+    total_budget: int,
+    review_ema: Optional[float],
+    min_budget: int = MIN_BUDGET_PER_AGENT,
+) -> int:
+    """Phase 2. Call this AFTER the PR is created — real diff, real
+    complexity, real remaining budget.
+
+    Caps the review agent at whatever's actually left of the shared
+    ceiling after what the Dev Agent actually used (not its allocation —
+    agents routinely use less than they're given), so a big Dev Agent
+    call doesn't leave the review agent starved for no reason, and a
+    small one doesn't get treated the same as a 40-file security-touching
+    diff, which is what the static ComplexitySignals(files_changed=1,
+    lines_changed=20) placeholder was doing before."""
+    signals = ComplexitySignals(
+        files_changed=len(changed_files),
+        lines_changed=diff_line_count(repo_root, base_sha, head_sha, changed_files),
+        is_security_sensitive=looks_security_sensitive(changed_files),
+        jira_priority_weight=1.0,
+    )
+    score = complexity_score(signals)
+
+    remaining_budget = max(total_budget - dev_actual_tokens_used, min_budget)
+
+    # score=40 already reflects a large, security-touching diff — cap the
+    # growth curve there so one huge PR can't claim the entire remaining
+    # budget and leave nothing as a floor.
+    scale = min(score / 40.0, 1.0)
+    raw_budget = max(int(remaining_budget * scale), min_budget)
+    raw_budget = min(raw_budget, remaining_budget)
+
+    return apply_ema_correction(raw_budget, review_ema)

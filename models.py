@@ -7,13 +7,13 @@ from dataclasses import dataclass, field
 from datetime import date
 from typing import Optional
 
-
+ 
 @dataclass
 class Book:
     isbn: str
     title: str
     author: str
-    total_copies: int
+    total_copies: int 
     available_copies: int
 
     def is_available(self) -> bool:

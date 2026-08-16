@@ -21,7 +21,10 @@ from typing import Any, Dict, List
 
 import yaml
 
-sys.path.append(os.path.join(os.path.dirname(__file__), "..", "common"))
+_AGENTS_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, os.path.join(_AGENTS_ROOT, "common"))
+from path_bootstrap import bootstrap  # noqa: E402
+bootstrap()
 from groq_client import GroqKeyPool, call_groq_json, load_prompt  # noqa: E402
 
 PROMPTS_DIR = os.path.join(os.path.dirname(__file__), "..", "prompts")

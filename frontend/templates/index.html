@@ -42,6 +42,11 @@
 <div id="jobSummary" class="job-summary"></div>
 <div id="timeline"></div>
 
+<div class="full-logs">
+  <button id="toggleLogsBtn" type="button">Show full raw logs</button>
+  <div id="fullLogs" style="display:none;"></div>
+</div>
+
 <div class="past-runs">
   <h3>Recent runs</h3>
   <div id="pastRuns"></div>
@@ -104,6 +109,20 @@ function renderTimeline(events) {
   }).join("");
 }
 
+function renderFullLogs(logs) {
+  const container = document.getElementById("fullLogs");
+  if (!logs || logs.length === 0) {
+    container.innerHTML = "<p style='color:var(--muted);'>No logs yet.</p>";
+    return;
+  }
+  container.innerHTML = logs.map(job => `
+    <div class="log-job-block">
+      <h4>${escapeHtml(job.job_name)}</h4>
+      <pre>${escapeHtml(job.lines.join("\n"))}</pre>
+    </div>
+  `).join("");
+}
+
 function renderJobSummary(jobs) {
   const container = document.getElementById("jobSummary");
   if (!jobs || jobs.length === 0) {
@@ -132,6 +151,7 @@ async function pollStatus(runId) {
 
     renderJobSummary(data.jobs);
     renderTimeline(data.events);
+    renderFullLogs(data.logs);
 
     if (data.run.status !== "completed") {
       pollHandle = setTimeout(() => pollStatus(runId), 3000);
@@ -199,6 +219,14 @@ document.getElementById("submitBtn").addEventListener("click", async () => {
     }
     loadPastRuns();
   }, 4000);
+});
+
+document.getElementById("toggleLogsBtn").addEventListener("click", () => {
+  const panel = document.getElementById("fullLogs");
+  const btn = document.getElementById("toggleLogsBtn");
+  const showing = panel.style.display !== "none";
+  panel.style.display = showing ? "none" : "block";
+  btn.textContent = showing ? "Show full raw logs" : "Hide full raw logs";
 });
 
 loadPastRuns();

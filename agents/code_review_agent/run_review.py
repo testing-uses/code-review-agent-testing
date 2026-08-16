@@ -31,10 +31,11 @@ from datetime import datetime, timezone
 
 AGENT_DIR = os.path.dirname(os.path.abspath(__file__))
 KB_DIR = os.path.join(AGENT_DIR, "..", "knowledge_base")
+AGENTS_ROOT = os.path.dirname(AGENT_DIR)
 
-for path in (AGENT_DIR, KB_DIR):
-    if path not in sys.path:
-        sys.path.insert(0, path)
+sys.path.insert(0, os.path.join(AGENTS_ROOT, "common"))
+from path_bootstrap import bootstrap  # noqa: E402
+bootstrap()
 
 from context_builder import build_context, render_context_for_prompt
 from decision_engine import decide

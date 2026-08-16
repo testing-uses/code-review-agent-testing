@@ -1,9 +1,12 @@
 """
-agents/dev_agent/dev_agent.py  (v2)
+agents/dev_agent/dev_agent.py  (v3)
 
 Produces code changes only — no git operations here. The orchestrator
-(master_agent.py) owns branching/committing/pushing/PR-creation, matching
-the separation of concerns you described.
+(master_agent.py) owns branching/committing/pushing/PR-creation.
+
+CHANGE from v2: uses path_bootstrap instead of its own relative
+sys.path.append calls (same fix as master_agent.py — see
+path_bootstrap.py for why the old pattern caused the ImportError).
 
 Editing mechanism (see agents/common/patch_apply.py):
     - Existing files: LLM outputs a unified diff -> applied via `git apply`.
@@ -16,8 +19,10 @@ import sys
 import time
 from typing import Any, Dict, List
 
-sys.path.append(os.path.join(os.path.dirname(__file__), "..", "common"))
-sys.path.append(os.path.join(os.path.dirname(__file__), "..", "knowledge_base"))
+_AGENTS_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, os.path.join(_AGENTS_ROOT, "common"))
+from path_bootstrap import bootstrap  # noqa: E402
+bootstrap()
 
 from groq_client import GroqKeyPool, call_groq_json, load_prompt  # noqa: E402
 from patch_apply import apply_unified_diff, write_full_file  # noqa: E402
@@ -85,8 +90,11 @@ def run(
     for rel_path, content in new_files.items():
         if rel_path.startswith("agents/") or rel_path.startswith(".github/"):
             continue
-        write_full_file(repo_root, rel_path, content)
-        changed_files.append(rel_path)
+        try:
+            write_full_file(repo_root, rel_path, content)
+            changed_files.append(rel_path)
+        except ValueError as error:
+            apply_errors.append(f"{rel_path}: {error}")
 
     for rel_path, diff_text in diffs.items():
         if rel_path.startswith("agents/") or rel_path.startswith(".github/"):
