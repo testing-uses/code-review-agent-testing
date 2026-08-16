@@ -1,7 +1,16 @@
 """
-agents/common/patch_apply.py (v2 — resilient + debuggable)
+agents/common/patch_apply.py (v3 — resilient + debuggable + path-safe)
 
-Changes from v1:
+Changes from v2:
+- Restores the missing _resolve_within_repo() helper. write_full_file()
+  was calling a function that was never defined in this file (a bad
+  copy/paste left a terminal command in the docstring and dropped the
+  helper), causing:
+      NameError: name '_resolve_within_repo' is not defined
+  This version defines it and uses it to prevent path traversal: any
+  rel_path from the LLM that would resolve outside repo_root (e.g. via
+  "../" or an absolute path) is rejected with a ValueError instead of
+  silently writing outside the repository.
 - Tries multiple `git apply` strategies before giving up, because LLM-
   generated unified diffs frequently have correct content but slightly
   wrong hunk-header line counts (`@@ -a,b +c,d @@`). `--recount` tells
@@ -24,6 +33,22 @@ APPLY_STRATEGIES = [
     ["git", "apply", "--whitespace=fix", "--recount", "--unidiff-zero"],
     ["git", "apply", "--whitespace=fix", "--recount", "--ignore-space-change", "--ignore-whitespace"],
 ]
+
+
+def _resolve_within_repo(repo_root: str, rel_path: str) -> str:
+    """Resolve rel_path against repo_root and reject any path that would
+    escape the repository (via '../', an absolute path, symlink tricks,
+    etc.). Returns the safe absolute path, or raises ValueError."""
+    repo_root_abs = os.path.abspath(repo_root)
+    candidate = os.path.abspath(os.path.join(repo_root_abs, rel_path))
+
+    if os.path.commonpath([repo_root_abs, candidate]) != repo_root_abs:
+        raise ValueError(
+            f"Refusing to write outside repo root: '{rel_path}' resolves to "
+            f"'{candidate}', which is outside '{repo_root_abs}'."
+        )
+
+    return candidate
 
 
 def write_full_file(repo_root: str, rel_path: str, content: str) -> None:
