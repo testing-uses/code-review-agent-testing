@@ -1,29 +1,40 @@
 """
-review_agent/context_builder.py  (v2 — token-optimized)
+review_agent/context_builder.py  (v3 — unified with the central KB)
 
-Key changes from v1:
-  - No more sending full file content AND the diff. The diff (with a small
-    unified-context window) is the primary evidence. Full file content is
-    only included for brand-new files or files under a tiny line threshold,
-    where the diff already equals ~the whole file anyway.
-  - Dependency context is now SYMBOL-SELECTIVE: only signatures of functions
-    /classes actually referenced by identifiers in the changed lines are
-    included, not every signature in every locally-imported file. This uses
-    the cached repo map (repo_map.py) instead of re-parsing files every run.
-  - A real token budget is enforced end-to-end, with a hard ceiling well
-    below the model's per-minute limit, and priority-based degradation:
-        1. diff (always kept, trimmed if needed)
-        2. referenced symbol signatures (dropped first if over budget)
-        3. full content of new/tiny files (dropped second)
+CHANGE from v2: symbol-selective dependency context used to come from
+repo_map.py, a second, disconnected symbol cache that only the review
+agent knew about. That's the opposite of "one central knowledge base
+shared across all contributors" — the review agent couldn't see anything
+the dev agent's KB had already indexed, and the two caches could drift
+out of sync independently.
+
+Now this pulls referenced-symbol signatures straight from the same
+kb.sqlite3 the Dev Agent and context_selector use (via kb_query), so
+there's exactly one graph/index in the system, not two. repo_map.py is
+no longer needed by this module.
+
+Everything else is unchanged: the diff is still the primary evidence,
+full file content is still limited to new/tiny files, and a hard token
+budget with priority-based degradation still applies:
+    1. diff (always kept, trimmed if needed)
+    2. referenced symbol signatures, resolved from the central KB
+    3. full content of new/tiny files (dropped first if over budget)
 """
 
 import os
 import re
 import subprocess
+import sys
 from dataclasses import dataclass, field
 from typing import Dict, List, Set, Tuple
 
-from repo_map import RepoMap, Symbol
+_AGENTS_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, os.path.join(_AGENTS_ROOT, "common"))
+from path_bootstrap import bootstrap  # noqa: E402
+bootstrap()
+
+from kb_schema import get_connection
+from kb_query import get_signatures_excluding
 
 CHARS_PER_TOKEN_ESTIMATE = 3.3      # slightly conservative vs. 4, to avoid
                                      # underestimating real token counts
@@ -90,6 +101,7 @@ def find_downstream_usages(repo_root: str, symbol_name: str, exclude_file: str) 
         usages.append((path, line_number, content.strip()))
     return usages
 
+
 @dataclass
 class ContextPackage:
     diff_text: str = ""
@@ -134,9 +146,9 @@ def get_narrow_diff(
 
 def extract_identifiers(diff_text: str) -> Set[str]:
     """Pull plausible function/class/variable identifiers out of the added
-    and removed diff lines, so we know which symbols to look up in the repo
-    map. Deliberately simple regex — false positives just mean we look up a
-    symbol that doesn't exist, which is a no-op."""
+    and removed diff lines, so we know which symbols to look up in the
+    central KB. Deliberately simple regex — false positives just mean we
+    look up a symbol that doesn't exist, which is a no-op."""
     identifiers = set()
     identifier_pattern = re.compile(r"\b[a-zA-Z_][a-zA-Z0-9_]*\b")
 
@@ -173,18 +185,22 @@ def build_context(
     changed_files: List[str],
     base_sha: str,
     head_sha: str,
-    repo_map: RepoMap,
+    db_path: str,
     max_tokens: int = 3000,
 ) -> ContextPackage:
+    """db_path points at the SAME kb.sqlite3 the Dev Agent / context_selector
+    use — this is the "current repo snapshot" the review agent gets: not
+    the whole codebase, just the diff plus the handful of KB-indexed
+    signatures actually referenced by the changed lines."""
     pkg = ContextPackage()
     budget = max_tokens
 
     # Priority 1: the narrow diff — always kept.
     diff_text = get_narrow_diff(
-    repo_root,
-    base_sha,
-    head_sha,
-    changed_files,
+        repo_root,
+        base_sha,
+        head_sha,
+        changed_files,
     )
     diff_cost = estimate_tokens(diff_text)
 
@@ -210,22 +226,30 @@ def build_context(
     pkg.diff_text = diff_text
     budget -= diff_cost
 
-    # Priority 2: symbol-selective dependency signatures (skip files already
-    # in changed_files — those are covered by the diff/full content).
-    if budget > 0:
+    # Priority 2: symbol-selective dependency signatures, resolved from the
+    # CENTRAL knowledge base (skip files already in changed_files — those
+    # are covered by the diff/full content already).
+    if budget > 0 and os.path.exists(db_path):
         identifiers = extract_identifiers(diff_text)
-        referenced: List[Symbol] = repo_map.resolve_symbols(
-            identifiers, exclude_files=set(changed_files)
-        )
+        conn = get_connection(db_path)
+        try:
+            referenced = get_signatures_excluding(
+                conn, identifiers, exclude_files=set(changed_files)
+            )
+        finally:
+            conn.close()
+
         for symbol in referenced:
-            entry = f"{symbol.file}: {symbol.signature}"
+            entry = f"{symbol['file']}: {symbol['signature']}"
             cost = estimate_tokens(entry)
             if cost > budget:
-                pkg.notes.append(f"Dropped symbol {symbol.name} (budget exceeded)")
+                pkg.notes.append(f"Dropped symbol {symbol['name']} (budget exceeded)")
                 pkg.truncated = True
                 continue
-            pkg.referenced_signatures[f"{symbol.file}:{symbol.name}"] = entry
+            pkg.referenced_signatures[f"{symbol['file']}:{symbol['name']}"] = entry
             budget -= cost
+    elif budget > 0:
+        pkg.notes.append(f"Central KB not found at {db_path} — skipping symbol context. Run build_kb.py first.")
 
     # Priority 3: full content of new/tiny changed files only.
     for rel_path in changed_files:
@@ -268,7 +292,7 @@ def render_context_for_prompt(pkg: ContextPackage) -> str:
                 parts.append(f"  - {path}:{line_number}: `{content}`")
 
     if pkg.referenced_signatures:
-        parts.append("## Referenced symbols (signature only)")
+        parts.append("## Referenced symbols (signature only, from central KB)")
         for key, entry in pkg.referenced_signatures.items():
             parts.append(f"- {entry}")
 

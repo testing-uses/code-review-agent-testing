@@ -1,15 +1,14 @@
-"""agents/orchestrator/master_agent.py  (v2)
+"""agents/orchestrator/master_agent.py  (v3)
 
-CHANGES from v1:
-  - review_result now read via its real key ("action": AUTO_APPROVE /
-    HUMAN_REVIEW / REJECT — decision_engine's actual vocabulary) instead
-    of a "status"/"PASS" pair that decision_engine never produces. That
-    mismatch meant CODE_REVIEW_PASSED was unreachable code before.
-  - The `except ImportError` around run_review_for_pr used to swallow a
-    real wiring bug and quietly continue to HUMAN_APPROVAL_REQUIRED as if
-    review had run. Now a failure to run review fails the workflow
-    closed (WORKFLOW_FAILED) with the real error surfaced, instead of
-    pretending review happened when it didn't.
+CHANGES from v2:
+  - Uses path_bootstrap.bootstrap() instead of hand-rolled relative
+    sys.path.append() calls — fixes the ImportError class of bug where
+    context_selector (and friends) could be reached via two different
+    sys.path entries in the same process.
+  - Phase-2 DCBA: after the Dev Agent's diff actually exists, the review
+    agent's budget is recomputed from real signals (dcba.reallocate_review_budget)
+    instead of staying pinned to the static placeholder guessed before
+    the diff existed.
 """
 
 import argparse
@@ -21,10 +20,10 @@ import uuid
 from datetime import datetime, timezone
 from typing import Any, Dict
 
-sys.path.append(os.path.join(os.path.dirname(__file__), "..", "common"))
-sys.path.append(os.path.join(os.path.dirname(__file__), "..", "dev_agent"))
-sys.path.append(os.path.join(os.path.dirname(__file__), "..", "knowledge_base"))
-sys.path.append(os.path.join(os.path.dirname(__file__), "..", "code_review_agent"))
+_AGENTS_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, os.path.join(_AGENTS_ROOT, "common"))
+from path_bootstrap import bootstrap  # noqa: E402
+bootstrap()
 
 from groq_client import GroqKeyPool, call_groq_json, load_prompt  # noqa: E402
 from github_ops import commit_and_push, create_pull_request, get_base_sha  # noqa: E402
@@ -34,6 +33,7 @@ from dcba import (  # noqa: E402
     allocate_budgets,
     apply_ema_correction,
     update_ema,
+    reallocate_review_budget,
     DEFAULT_TOTAL_BUDGET,
 )
 from metrics_store import record_metric, build_metric, get_last_ema  # noqa: E402
@@ -123,20 +123,15 @@ def run_pipeline(
             raw_budgets["code_review_agent"], review_ema
         ),
     }
-    report["dcba_budgets"] = budgets
+    report["dcba_budgets_phase1"] = dict(budgets)
 
     emit(
         "dcba_allocated",
         total_budget=total_budget,
         raw_scores=raw_scores,
         dev_agent_tokens=budgets["dev_agent"],
-        code_review_agent_tokens=budgets["code_review_agent"],
+        code_review_agent_tokens_initial_estimate=budgets["code_review_agent"],
     )
-    # NOTE: review_signals above are static placeholders — the real diff
-    # size isn't known until AFTER the Dev Agent runs, so this budget
-    # split is only ever a rough guess for the review side. Not fixed
-    # here (needs a second DCBA pass post-diff); flagging so it doesn't
-    # get mistaken for a real complexity-based allocation.
 
     state = transition(state, WorkflowState.DEV_IN_PROGRESS)
     emit(
@@ -156,7 +151,8 @@ def run_pipeline(
     dev_latency = (time.time() - dev_start) * 1000
 
     usage = dev_result.get("usage", {})
-    new_dev_ema = update_ema(dev_ema, usage.get("total_tokens", 0) or 0)
+    dev_actual_tokens = usage.get("total_tokens") or 0
+    new_dev_ema = update_ema(dev_ema, dev_actual_tokens)
     record_metric(
         METRICS_PATH,
         build_metric(
@@ -239,6 +235,25 @@ def run_pipeline(
         "head_sha": head_sha,
     }
 
+    # ---- DCBA phase 2: reallocate the review budget from the REAL diff ----
+    refined_review_budget = reallocate_review_budget(
+        repo_root=repo_root,
+        base_sha=base_sha,
+        head_sha=head_sha,
+        changed_files=dev_result["changed_files"],
+        dev_actual_tokens_used=dev_actual_tokens or budgets["dev_agent"],
+        total_budget=total_budget,
+        review_ema=review_ema,
+    )
+    budgets["code_review_agent"] = refined_review_budget
+    report["dcba_budgets_phase2"] = {"code_review_agent": refined_review_budget}
+    emit(
+        "dcba_review_budget_refined",
+        refined_tokens=refined_review_budget,
+        initial_estimate=raw_budgets["code_review_agent"],
+        based_on_actual_diff=True,
+    )
+
     state = transition(state, WorkflowState.CODE_REVIEW_IN_PROGRESS)
     emit("code_review_started", pull_request=pr_number, allocated_tokens=budgets["code_review_agent"])
 
@@ -263,6 +278,8 @@ def run_pipeline(
     decision_action = review_result.get("action")
     emit("code_review_finished", action=decision_action, result=review_result, error=review_error)
 
+    review_actual_tokens = None  # review agent doesn't return usage yet — see note below
+
     if review_error is not None:
         # Fail closed: review genuinely did not run. Don't pretend it did
         # by routing to HUMAN_APPROVAL_REQUIRED as if a review happened.
@@ -274,10 +291,6 @@ def run_pipeline(
         state = transition(state, WorkflowState.WORKFLOW_FAILED)
         emit("workflow_failed", task_id=task_id, stage="code_review", reason="REJECT")
     else:
-        # AUTO_APPROVE or HUMAN_REVIEW both still land on a human gate —
-        # decision_engine's AUTO_APPROVE means "the agent thinks this is
-        # fine", not "skip the human". See github_bot.py fix: AUTO_APPROVE
-        # no longer triggers auto-merge on its own.
         target = (
             WorkflowState.CODE_REVIEW_PASSED
             if decision_action == "AUTO_APPROVE"

@@ -1,296 +1,187 @@
 """
-review_agent/context_builder.py  (v3 — unified with the central KB)
+agents/knowledge_base/context_selector.py  (v2)
 
-CHANGE from v2: symbol-selective dependency context used to come from
-repo_map.py, a second, disconnected symbol cache that only the review
-agent knew about. That's the opposite of "one central knowledge base
-shared across all contributors" — the review agent couldn't see anything
-the dev agent's KB had already indexed, and the two caches could drift
-out of sync independently.
+The unified context-assembly service used by BOTH the Dev Agent and the
+Code Review Agent. Implements:
 
-Now this pulls referenced-symbol signatures straight from the same
-kb.sqlite3 the Dev Agent and context_selector use (via kb_query), so
-there's exactly one graph/index in the system, not two. repo_map.py is
-no longer needed by this module.
+    1. Hybrid retrieval  = BM25 (lexical) + cosine similarity (semantic).
+    2. Personalized PageRank = ranks symbols by graph proximity to the
+       task's seed files/symbols (same algorithm family as Aider's repo map).
+    3. Budget-constrained MMR selection (NEW — see below).
 
-Everything else is unchanged: the diff is still the primary evidence,
-full file content is still limited to new/tiny files, and a hard token
-budget with priority-based degradation still applies:
-    1. diff (always kept, trimmed if needed)
-    2. referenced symbol signatures, resolved from the central KB
-    3. full content of new/tiny files (dropped first if over budget)
+CHANGE from v1: step 3 used to be plain greedy selection by
+fused_relevance/token_cost. That's a fine knapsack heuristic for
+maximizing *relevance density*, but it has a known failure mode: if
+several top-ranked symbols are near-duplicates of each other (e.g. three
+overloaded variants of the same helper, or a function and the thin
+wrapper that just calls it), greedy selection happily spends budget on
+all three, because each one individually still scores well — even
+though the second and third add almost no new information over the
+first.
+
+Replaced with Maximal Marginal Relevance (Carbonell & Goldstein, 1998):
+at each step, pick the candidate that maximizes
+    lambda * relevance - (1 - lambda) * max_similarity_to_already_selected
+instead of just picking by relevance. This is a direct, well-understood
+fix for exactly the redundancy problem a fixed token budget makes worse
+— you want the budget spent on *diverse* relevant context, not five
+near-identical entries about the same thing. Diversity is measured with
+the same cosine similarity over term vectors already computed for
+retrieval, so this adds no new infrastructure.
 """
 
+import json
 import os
-import re
-import subprocess
+import sys
 from dataclasses import dataclass, field
-from typing import Dict, List, Set, Tuple
+from typing import Dict, List, Set
 
-from kb_schema import get_connection
-from kb_query import get_signatures_excluding
+_AGENTS_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, os.path.join(_AGENTS_ROOT, "common"))
+from path_bootstrap import bootstrap  # noqa: E402
+bootstrap()
 
-CHARS_PER_TOKEN_ESTIMATE = 3.3      # slightly conservative vs. 4, to avoid
-                                     # underestimating real token counts
-SAFETY_MARGIN = 1.15                # inflate estimates by 15% as a buffer
+from bm25 import compute_bm25_scores  # noqa: E402
+from kb_query import _cosine_similarity, personalized_pagerank  # noqa: E402
+from groq_client import estimate_tokens  # noqa: E402
 
-NEW_OR_TINY_FILE_LINE_THRESHOLD = 25
-DIFF_CONTEXT_LINES = 2               # git diff -U2 instead of default -U3
-
-
-import ast
-
-
-def get_file_at_ref(repo_root: str, ref: str, rel_path: str) -> str:
-    result = subprocess.run(
-        ["git", "show", f"{ref}:{rel_path}"],
-        cwd=repo_root, capture_output=True, text=True,
-    )
-    return result.stdout if result.returncode == 0 else ""
-
-
-def extract_top_level_names(source: str) -> Set[str]:
-    try:
-        tree = ast.parse(source)
-    except SyntaxError:
-        return set()
-    names = set()
-    for node in ast.walk(tree):
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
-            names.add(node.name)
-    return names
-
-
-def find_removed_symbols(repo_root: str, rel_path: str, base_sha: str) -> Set[str]:
-    """Symbols defined at base_sha that no longer exist (or are now commented
-    out / deleted) in the current working tree version of the file."""
-    old_source = get_file_at_ref(repo_root, base_sha, rel_path)
-    full_path = os.path.join(repo_root, rel_path)
-    new_source = ""
-    if os.path.exists(full_path):
-        with open(full_path, "r", encoding="utf-8") as fh:
-            new_source = fh.read()
-
-    old_names = extract_top_level_names(old_source)
-    new_names = extract_top_level_names(new_source)
-    return old_names - new_names
-
-
-def find_downstream_usages(repo_root: str, symbol_name: str, exclude_file: str) -> List[Tuple[str, str, str]]:
-    """Find other .py files in the repo that still reference a symbol that
-    was just removed from the changed file. This is the reverse-dependency
-    check the diff alone can never surface."""
-    result = subprocess.run(
-        ["git", "grep", "-n", "-w", symbol_name, "--", "*.py"],
-        cwd=repo_root, capture_output=True, text=True,
-    )
-    usages = []
-    for line in result.stdout.splitlines():
-        parts = line.split(":", 2)
-        if len(parts) < 3:
-            continue
-        path, line_number, content = parts
-        if path == exclude_file:
-            continue
-        usages.append((path, line_number, content.strip()))
-    return usages
+FUSION_WEIGHTS = {"bm25": 0.4, "cosine": 0.35, "pagerank": 0.25}
+MMR_LAMBDA = 0.7  # 0.7 relevance / 0.3 diversity — tune down for more diverse, less relevant
 
 
 @dataclass
-class ContextPackage:
-    diff_text: str = ""
-    full_files: Dict[str, str] = field(default_factory=dict)
-    referenced_signatures: Dict[str, str] = field(default_factory=dict)
-    removed_symbols_with_usages: List[Tuple[str, str, List[Tuple[str, str, str]]]] = field(default_factory=list)
-    truncated: bool = False
-    notes: List[str] = field(default_factory=list)
-    estimated_tokens: int = 0
+class ContextEntry:
+    name: str
+    file: str
+    signature: str
+    docstring: str
+    fused_score: float
+    token_cost: int
+    term_vector: Dict[str, int] = field(default_factory=dict)
 
 
-def estimate_tokens(text: str) -> int:
-    return max(1, int((len(text) / CHARS_PER_TOKEN_ESTIMATE) * SAFETY_MARGIN))
+def _extract_query_term_vector(query_text: str) -> Dict[str, int]:
+    import re
+    from collections import Counter
+    terms = re.findall(r"[a-zA-Z_][a-zA-Z0-9_]*", query_text.lower())
+    return dict(Counter(t for t in terms if len(t) > 2))
 
 
-def get_narrow_diff(
-    repo_root: str,
-    base_sha: str,
-    head_sha: str,
-    changed_files: List[str],
-) -> str:
-    command = [
-        "git",
-        "diff",
-        f"-U{DIFF_CONTEXT_LINES}",
-        base_sha,
-        head_sha,
-        "--",
-        *changed_files,
+def _identify_seed_symbols(query_text: str, all_symbol_names: Set[str]) -> Set[str]:
+    """Symbols explicitly named in the task/diff text — used as PageRank
+    restart seeds, i.e. "what the task is actually about"."""
+    query_tokens = set(_extract_query_term_vector(query_text).keys())
+    return query_tokens & all_symbol_names
+
+
+def _mmr_select(candidates: List[ContextEntry], budget_tokens: int, mmr_lambda: float = MMR_LAMBDA) -> List[ContextEntry]:
+    """Budget-constrained MMR: repeatedly pick the candidate that best
+    trades off relevance against redundancy with what's already selected,
+    normalized by token cost (so a cheap-but-good entry isn't starved by
+    an expensive-but-slightly-better one). O(n^2) in candidate count,
+    which is fine since candidates is already capped upstream."""
+    selected: List[ContextEntry] = []
+    remaining = list(candidates)
+    used_tokens = 0
+
+    while remaining:
+        affordable = [c for c in remaining if used_tokens + c.token_cost <= budget_tokens]
+        if not affordable:
+            break
+
+        best_entry = None
+        best_mmr = float("-inf")
+        for candidate in affordable:
+            redundancy = 0.0
+            if selected:
+                redundancy = max(
+                    _cosine_similarity(candidate.term_vector, s.term_vector) for s in selected
+                )
+            mmr_score = mmr_lambda * candidate.fused_score - (1 - mmr_lambda) * redundancy
+            mmr_score = mmr_score / max(candidate.token_cost, 1)
+            if mmr_score > best_mmr:
+                best_mmr = mmr_score
+                best_entry = candidate
+
+        selected.append(best_entry)
+        used_tokens += best_entry.token_cost
+        remaining.remove(best_entry)
+
+    return selected
+
+
+def select_context(conn, query_text: str, budget_tokens: int, top_k_candidates: int = 30) -> str:
+    """Returns a rendered, budget-fitted context string ready to drop into
+    an agent's user prompt."""
+    cursor = conn.cursor()
+    cursor.execute("SELECT name, file, kind, signature, docstring, term_vector FROM symbols")
+    rows = cursor.fetchall()
+
+    if not rows:
+        return "(knowledge base is empty — run build_kb.py first)"
+
+    symbols = [
+        {
+            "name": r[0], "file": r[1], "kind": r[2], "signature": r[3],
+            "docstring": r[4] or "", "term_vector": json.loads(r[5]) if r[5] else {},
+        }
+        for r in rows
     ]
 
-    result = subprocess.run(
-        command,
-        cwd=repo_root,
-        capture_output=True,
-        text=True,
-        check=True,
+    # ---- 1. Hybrid retrieval: BM25 (lexical) ----
+    documents = {
+        f"{s['name']}::{s['file']}": f"{s['name']} {s['signature']} {s['docstring']}"
+        for s in symbols
+    }
+    bm25_scores = compute_bm25_scores(query_text, documents)
+
+    # ---- 1b. Hybrid retrieval: cosine similarity (semantic-ish) ----
+    query_vector = _extract_query_term_vector(query_text)
+    cosine_scores = {
+        f"{s['name']}::{s['file']}": _cosine_similarity(query_vector, s["term_vector"])
+        for s in symbols
+    }
+
+    # ---- 2. Personalized PageRank, seeded on symbols the task actually names ----
+    all_names = {s["name"] for s in symbols}
+    seed_symbols = _identify_seed_symbols(query_text, all_names)
+    pagerank_scores = personalized_pagerank(conn, seed_symbols) if seed_symbols else {}
+    max_pagerank = max(pagerank_scores.values()) if pagerank_scores else 1.0
+
+    # ---- Fuse all three signals into one relevance score per symbol ----
+    candidates: List[ContextEntry] = []
+    for symbol in symbols:
+        key = f"{symbol['name']}::{symbol['file']}"
+        bm25_component = bm25_scores.get(key, 0.0)
+        cosine_component = cosine_scores.get(key, 0.0)
+        pagerank_component = pagerank_scores.get(symbol["name"], 0.0) / max_pagerank if max_pagerank else 0.0
+
+        fused = (
+            FUSION_WEIGHTS["bm25"] * bm25_component
+            + FUSION_WEIGHTS["cosine"] * cosine_component
+            + FUSION_WEIGHTS["pagerank"] * pagerank_component
+        )
+        if fused <= 0:
+            continue
+
+        entry_text = f"- {symbol['file']}: {symbol['signature']}  # {symbol['docstring'][:80]}"
+        candidates.append(ContextEntry(
+            name=symbol["name"], file=symbol["file"], signature=symbol["signature"],
+            docstring=symbol["docstring"], fused_score=fused,
+            token_cost=estimate_tokens(entry_text),
+            term_vector=symbol["term_vector"],
+        ))
+
+    candidates.sort(key=lambda c: c.fused_score, reverse=True)
+    candidates = candidates[:top_k_candidates]
+
+    # ---- 3. Budget-constrained MMR selection (relevance vs. redundancy) ----
+    selected = _mmr_select(candidates, budget_tokens)
+
+    if not selected:
+        return "(no relevant existing symbols found within the token budget)"
+
+    return "\n".join(
+        f"- {c.file}: {c.signature}  # {c.docstring[:80]}  (relevance={c.fused_score:.2f})"
+        for c in selected
     )
-
-    return result.stdout
-
-
-def extract_identifiers(diff_text: str) -> Set[str]:
-    """Pull plausible function/class/variable identifiers out of the added
-    and removed diff lines, so we know which symbols to look up in the
-    central KB. Deliberately simple regex — false positives just mean we
-    look up a symbol that doesn't exist, which is a no-op."""
-    identifiers = set()
-    identifier_pattern = re.compile(r"\b[a-zA-Z_][a-zA-Z0-9_]*\b")
-
-    for line in diff_text.splitlines():
-        if line.startswith(("+++", "---", "@@")):
-            continue
-        if line.startswith(("+", "-")):
-            identifiers.update(identifier_pattern.findall(line[1:]))
-
-    return identifiers
-
-
-def is_new_or_tiny(repo_root: str, rel_path: str, base_sha: str) -> bool:
-    """A file counts as 'new or tiny' if it didn't exist at base_sha, or it
-    has few enough lines that the diff already captures ~all of it."""
-    check = subprocess.run(
-        ["git", "cat-file", "-e", f"{base_sha}:{rel_path}"],
-        cwd=repo_root, capture_output=True,
-    )
-    is_new = check.returncode != 0
-
-    full_path = os.path.join(repo_root, rel_path)
-    if not os.path.exists(full_path):
-        return is_new
-
-    with open(full_path, "r", encoding="utf-8") as fh:
-        line_count = sum(1 for _ in fh)
-
-    return is_new or line_count <= NEW_OR_TINY_FILE_LINE_THRESHOLD
-
-
-def build_context(
-    repo_root: str,
-    changed_files: List[str],
-    base_sha: str,
-    head_sha: str,
-    db_path: str,
-    max_tokens: int = 3000,
-) -> ContextPackage:
-    """db_path points at the SAME kb.sqlite3 the Dev Agent / context_selector
-    use — this is the "current repo snapshot" the review agent gets: not
-    the whole codebase, just the diff plus the handful of KB-indexed
-    signatures actually referenced by the changed lines."""
-    pkg = ContextPackage()
-    budget = max_tokens
-
-    # Priority 1: the narrow diff — always kept.
-    diff_text = get_narrow_diff(
-        repo_root,
-        base_sha,
-        head_sha,
-        changed_files,
-    )
-    diff_cost = estimate_tokens(diff_text)
-
-    removed_symbols_report = []
-    for rel_path in changed_files:
-        if not rel_path.endswith(".py"):
-            continue
-        removed = find_removed_symbols(repo_root, rel_path, base_sha)
-        for symbol in removed:
-            usages = find_downstream_usages(repo_root, symbol, rel_path)
-            if usages:
-                removed_symbols_report.append((symbol, rel_path, usages))
-
-    pkg.removed_symbols_with_usages = removed_symbols_report
-
-    if diff_cost > budget:
-        keep_chars = int(budget * CHARS_PER_TOKEN_ESTIMATE / SAFETY_MARGIN)
-        diff_text = diff_text[:keep_chars]
-        pkg.truncated = True
-        pkg.notes.append("Diff truncated to fit token budget")
-        diff_cost = estimate_tokens(diff_text)
-
-    pkg.diff_text = diff_text
-    budget -= diff_cost
-
-    # Priority 2: symbol-selective dependency signatures, resolved from the
-    # CENTRAL knowledge base (skip files already in changed_files — those
-    # are covered by the diff/full content already).
-    if budget > 0 and os.path.exists(db_path):
-        identifiers = extract_identifiers(diff_text)
-        conn = get_connection(db_path)
-        try:
-            referenced = get_signatures_excluding(
-                conn, identifiers, exclude_files=set(changed_files)
-            )
-        finally:
-            conn.close()
-
-        for symbol in referenced:
-            entry = f"{symbol['file']}: {symbol['signature']}"
-            cost = estimate_tokens(entry)
-            if cost > budget:
-                pkg.notes.append(f"Dropped symbol {symbol['name']} (budget exceeded)")
-                pkg.truncated = True
-                continue
-            pkg.referenced_signatures[f"{symbol['file']}:{symbol['name']}"] = entry
-            budget -= cost
-    elif budget > 0:
-        pkg.notes.append(f"Central KB not found at {db_path} — skipping symbol context. Run build_kb.py first.")
-
-    # Priority 3: full content of new/tiny changed files only.
-    for rel_path in changed_files:
-        if budget <= 0:
-            pkg.notes.append(f"{rel_path} full content dropped (out of budget)")
-            pkg.truncated = True
-            continue
-        if not is_new_or_tiny(repo_root, rel_path, base_sha):
-            continue
-        full_path = os.path.join(repo_root, rel_path)
-        if not os.path.exists(full_path):
-            continue
-        with open(full_path, "r", encoding="utf-8") as fh:
-            content = fh.read()
-        cost = estimate_tokens(content)
-        if cost <= budget:
-            pkg.full_files[rel_path] = content
-            budget -= cost
-        else:
-            pkg.notes.append(f"{rel_path} full content dropped (exceeds remaining budget)")
-            pkg.truncated = True
-
-    pkg.estimated_tokens = max_tokens - budget
-    return pkg
-
-
-def render_context_for_prompt(pkg: ContextPackage) -> str:
-    parts = [f"## Diff\n```diff\n{pkg.diff_text}\n```"]
-
-    if pkg.full_files:
-        parts.append("## New / small files (full content)")
-        for path, content in pkg.full_files.items():
-            parts.append(f"### {path}\n```python\n{content}\n```")
-
-    if pkg.removed_symbols_with_usages:
-        parts.append("## ⚠ BREAKING CHANGE WARNING — removed symbols still referenced elsewhere")
-        for symbol, source_file, usages in pkg.removed_symbols_with_usages:
-            parts.append(f"`{symbol}` was removed from `{source_file}` but is still used in:")
-            for path, line_number, content in usages:
-                parts.append(f"  - {path}:{line_number}: `{content}`")
-
-    if pkg.referenced_signatures:
-        parts.append("## Referenced symbols (signature only, from central KB)")
-        for key, entry in pkg.referenced_signatures.items():
-            parts.append(f"- {entry}")
-
-    if pkg.truncated:
-        parts.append("## Context notes\n" + "\n".join(f"- {n}" for n in pkg.notes))
-
-    return "\n\n".join(parts)

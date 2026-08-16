@@ -71,6 +71,24 @@
     margin: 8px 0 0 0; max-height: 260px;
   }
 
+  .full-logs { margin-top: 18px; }
+  .full-logs button {
+    background: var(--panel); color: var(--text); border: 1px solid var(--border);
+    font-weight: 500; font-size: 12px; padding: 6px 12px;
+  }
+  .full-logs button:hover { border-color: var(--accent); }
+  #fullLogs { margin-top: 12px; }
+  .log-job-block { margin-bottom: 16px; }
+  .log-job-block h4 {
+    font-size: 12px; text-transform: uppercase; letter-spacing: 0.04em;
+    color: var(--muted); margin: 0 0 6px 0;
+  }
+  .log-job-block pre {
+    background: var(--panel); border: 1px solid var(--border); color: var(--text);
+    padding: 10px; border-radius: 6px; font-size: 11px; line-height: 1.5;
+    overflow-x: auto; max-height: 420px; white-space: pre-wrap; word-break: break-word;
+  }
+
   .past-runs { margin-top: 34px; }
   .past-runs h3 { color: var(--muted); font-size: 13px; text-transform: uppercase; letter-spacing: 0.05em; }
   .run-card {
@@ -96,6 +114,11 @@
 <div id="runStatusText"></div>
 <div id="jobSummary" class="job-summary"></div>
 <div id="timeline"></div>
+
+<div class="full-logs">
+  <button id="toggleLogsBtn" type="button">Show full raw logs</button>
+  <div id="fullLogs" style="display:none;"></div>
+</div>
 
 <div class="past-runs">
   <h3>Recent runs</h3>
@@ -192,6 +215,20 @@ function renderTimeline(events) {
   }).join("");
 }
 
+function renderFullLogs(logs) {
+  const container = document.getElementById("fullLogs");
+  if (!logs || logs.length === 0) {
+    container.innerHTML = "<p style='color:var(--muted);'>No logs yet.</p>";
+    return;
+  }
+  container.innerHTML = logs.map(job => `
+    <div class="log-job-block">
+      <h4>${escapeHtml(job.job_name)}</h4>
+      <pre>${escapeHtml(job.lines.join("\n"))}</pre>
+    </div>
+  `).join("");
+}
+
 function renderJobSummary(jobs) {
   const container = document.getElementById("jobSummary");
   if (!jobs || jobs.length === 0) {
@@ -222,6 +259,7 @@ async function pollStatus(runId) {
 
     renderJobSummary(data.jobs);
     renderTimeline(data.events);
+    renderFullLogs(data.logs);
 
     if (data.run.status !== "completed") {
       pollHandle = setTimeout(() => pollStatus(runId), 3000);
@@ -289,6 +327,14 @@ document.getElementById("submitBtn").addEventListener("click", async () => {
     }
     loadPastRuns();
   }, 4000);
+});
+
+document.getElementById("toggleLogsBtn").addEventListener("click", () => {
+  const panel = document.getElementById("fullLogs");
+  const btn = document.getElementById("toggleLogsBtn");
+  const showing = panel.style.display !== "none";
+  panel.style.display = showing ? "none" : "block";
+  btn.textContent = showing ? "Show full raw logs" : "Hide full raw logs";
 });
 
 loadPastRuns();
