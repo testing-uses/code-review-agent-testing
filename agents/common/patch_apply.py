@@ -1,14 +1,15 @@
 """
-agents/common/patch_apply.py (v3 — resilient + debuggable + path-safe)
+agents/common/patch_apply.py (v2 — resilient + debuggable)
 
-CHANGE from v2: write_full_file() joined an LLM-provided relative path
-straight into repo_root with no check. A path like "../../.ssh/whatever"
-or an absolute path would have written outside the repo. Added a
-containment check — this doesn't fully replace treating LLM output as
-untrusted, but it closes the obvious traversal hole.
-
-Everything else (multi-strategy git apply, debuggable failure messages)
-unchanged from v2.
+Changes from v1:
+- Tries multiple `git apply` strategies before giving up, because LLM-
+  generated unified diffs frequently have correct content but slightly
+  wrong hunk-header line counts (`@@ -a,b +c,d @@`). `--recount` tells
+  git to ignore the header counts and recompute them from the actual
+  hunk body, which fixes the single most common LLM diff failure mode.
+- On total failure, the raw diff text (truncated) is included in the
+  returned message, so the orchestrator's BLOCKED reason actually shows
+  what the model produced instead of just git's opaque stderr.
 """
 
 import os
@@ -23,20 +24,6 @@ APPLY_STRATEGIES = [
     ["git", "apply", "--whitespace=fix", "--recount", "--unidiff-zero"],
     ["git", "apply", "--whitespace=fix", "--recount", "--ignore-space-change", "--ignore-whitespace"],
 ]
-
-
-def _resolve_within_repo(repo_root: str, rel_path: str) -> str:
-    """Resolve rel_path against repo_root and refuse anything that
-    escapes it (via '..', an absolute path, or a symlink trick)."""
-    repo_root_abs = os.path.realpath(repo_root)
-    full_path = os.path.realpath(os.path.join(repo_root_abs, rel_path))
-
-    if os.path.commonpath([repo_root_abs, full_path]) != repo_root_abs:
-        raise ValueError(
-            f"Refusing to write outside repo root: '{rel_path}' resolves to "
-            f"'{full_path}', which escapes '{repo_root_abs}'."
-        )
-    return full_path
 
 
 def write_full_file(repo_root: str, rel_path: str, content: str) -> None:
@@ -56,12 +43,7 @@ def apply_unified_diff(repo_root: str, diff_text: str) -> Tuple[bool, str]:
     """Applies a unified diff via `git apply`, trying progressively more
     lenient strategies. Returns (success, message). On failure, message
     includes both git's stderr AND a snippet of the raw diff so failures
-    are actually debuggable instead of just 'corrupt patch at line N'.
-
-    Path containment for diffs is left to `git apply` itself (which
-    already refuses to touch paths outside the working tree via its
-    own path-prefix handling) — the explicit check above is specifically
-    for write_full_file, which had no such protection at all."""
+    are actually debuggable instead of just 'corrupt patch at line N'."""
     with tempfile.NamedTemporaryFile(
         mode="w", suffix=".diff", delete=False, encoding="utf-8"
     ) as tmp_file:
