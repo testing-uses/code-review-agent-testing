@@ -1,70 +1,26 @@
-"""
-Legacy code (dummy, for POC purposes).
-Library Management System - interactive terminal entry point.
-"""
-
+import datetime
+from models import Loan
 from storage import LibraryStore
 
-MENU = """
-1. Add book
-2. Register member
-3. Borrow book
-4. Return book
-5. List books
-6. Show overdue loans
-0. Exit
-"""
+class CLI:
+    def __init__(self, store: LibraryStore):
+        self.store = store
 
+    def list_overdue_loans(self):
+        today = datetime.date.today()
+        overdue_loans = self.store.overdue_loans()
+        for loan in overdue_loans:
+            if not loan.is_returned:
+                print(f'Loan ID: {loan.id}, Book ID: {loan.book_id}, Borrower ID: {loan.member_id}, Due Date: {loan.due_date}')
 
-def main():
-    store = LibraryStore()
-
-    while True:
-        print(MENU)
-        choice = input("Choose an option: ").strip()
-
-        if choice == "1":
-            isbn = input("ISBN: ").strip()
-            title = input("Title: ").strip()
-            author = input("Author: ").strip()
-            copies = int(input("Copies: ").strip())
-            store.add_book(isbn, title, author, copies)
-            print("Book added.")
-
-        elif choice == "2":
-            member_id = input("Member ID: ").strip()
-            name = input("Name: ").strip()
-            store.register_member(member_id, name)
-            print("Member registered.")
-
-        elif choice == "3":
-            isbn = input("ISBN: ").strip()
-            member_id = input("Member ID: ").strip()
-            loan = store.borrow_book(isbn, member_id)
-            print("Borrowed." if loan else "Could not borrow book.")
-
-        elif choice == "4":
-            isbn = input("ISBN: ").strip()
-            member_id = input("Member ID: ").strip()
-            ok = store.return_book(isbn, member_id)
-            print("Returned." if ok else "No matching active loan found.")
-
-        elif choice == "5":
-            for book in store.list_books():
-                print(f"{book.isbn} | {book.title} | {book.author} | "
-                      f"{book.available_copies}/{book.total_copies} available")
-
-        elif choice == "6":
-            for loan in store.overdue_loans():
-                print(f"{loan.isbn} borrowed by {loan.member_id}, due {loan.due_date}")
-
-        elif choice == "0":
-            print("Goodbye.")
-            break
-
-        else:
-            print("Invalid option.")
-
-
-if __name__ == "__main__":
-    main() 
+    def run(self):
+        while True:
+            print('1. List Overdue Loans')
+            print('2. Exit')
+            choice = input('Choose an option: ')
+            if choice == '1':
+                self.list_overdue_loans()
+            elif choice == '2':
+                break
+            else:
+                print('Invalid option. Please choose again.')
