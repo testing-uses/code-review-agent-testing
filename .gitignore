@@ -5,3 +5,5 @@ token_usage.txt
 .review_agent_cache/
 agents/knowledge_base/kb.sqlite3
 agents/orchestrator/metrics.jsonl
+.vscode/
+
