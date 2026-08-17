@@ -132,6 +132,14 @@ def _build_ground_truth_block(repo_root: str, target_files: List[str]) -> Tuple[
         return "(no exact file content available -- do not guess at file structure; set blocked=true instead)", verified
     return "\n\n".join(blocks), verified
 
+def _files_requiring_full_replacement(target_files: List[str], max_chars: int = GROUND_TRUTH_MAX_CHARS_PER_FILE) -> Set[str]:
+    """Any file we supplied as ground truth is small enough that a full
+    replacement is cheap and dramatically more reliable than a unified
+    diff from this model. Diffs on these files are now rejected outright
+    rather than sent to git apply -- three separate real failures (wrong
+    line targeted, synthetic no-op hunk, and context/indentation mismatch)
+    show unified-diff generation is not reliable enough to trust here."""
+    return set(target_files)
 
 def _validate_preserves_structure(original: str, rewritten: str, min_similarity: float = REWRITE_SIMILARITY_FLOOR) -> bool:
     """A legitimate small edit to an existing file should be near-identical
@@ -184,6 +192,7 @@ def run(
     target_files = _guess_target_files(task_text, repo_root)
     ground_truth_block, verified_ground_truth_files = _build_ground_truth_block(repo_root, target_files)
 
+
     user_prompt = (
         f"## Task\n{task_text}\n\n"
         f"## Relevant existing code (hybrid BM25 + vector + PageRank retrieval -- signatures only, NOT ground truth)\n"
@@ -212,7 +221,26 @@ def run(
             "blocked_reason": result.get("blocked_reason", "unspecified"),
             "usage": usage, "latency_ms": latency_ms,
         }
+    ground_truth_files = set(target_files)
 
+    for rel_path, diff_text in diffs.items():
+        if rel_path.startswith("agents/") or rel_path.startswith(".github/"):
+            continue
+
+        if rel_path in ground_truth_files:
+            apply_errors.append(
+                f"{rel_path}: diffs are not permitted for files supplied as "
+                f"ground truth -- resubmit using new_files with the complete "
+                f"file content instead. This file's diff was rejected before "
+                f"being sent to git apply."
+            )
+            continue
+
+        success, message = apply_unified_diff(repo_root, diff_text)
+        if success:
+            changed_files.append(rel_path)
+        else:
+            apply_errors.append(f"{rel_path}: {message}")
     diffs = result.get("diffs", {}) or {}
     new_files = result.get("new_files", {}) or {}
 

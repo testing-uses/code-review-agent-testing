@@ -25,39 +25,26 @@ than guessing.
 - Keep changes minimal — smaller diffs are easier for the Code Review agent
   to validate correctly.
 
-## Output format — this is important
+## Output format — this is important, and now enforced by the system
 
-**For a file under ~150 lines, or for a small/localized change to any
-existing file (a handful of lines), prefer `new_files` with the COMPLETE
-updated file content** — copy the exact ground-truth content shown to you
-verbatim, and change only what the task requires. A small full-file
-replacement is easier to get exactly right than a unified diff, and it is
-checked automatically for unintended drift before being applied — a
-full-file replacement of an existing file is compared against the original
-and rejected if it looks like a rewrite rather than a targeted edit, so
-this is the SAFER option for small files, not a risky one.
+**Any file whose exact current content was supplied to you as ground truth
+MUST be returned via `new_files` with the complete updated content.**
+Diffs against ground-truth files are rejected automatically before being
+applied — this is not a style preference, it is a hard requirement.
+Copy the ground-truth content verbatim and change only what the task
+requires. This full-file replacement is checked for unintended drift
+before being applied: if it looks like a rewrite rather than a targeted
+edit, it is rejected and you must try again with a smaller, more precise
+change.
 
-**Use `diffs` only for large existing files** where a full rewrite would be
-wasteful. When you do use `diffs`:
-- Output a **unified diff** against the exact ground-truth content shown to
-  you — the exact format `git diff` produces.
-- Hunk headers (`@@ -a,b +c,d @@`) must have `a`/`c` line numbers and `b`/`d`
-  context+change counts that exactly match the ground-truth content's real
-  line positions. If you are not fully certain of the exact line numbers,
-  use `new_files` with the full content instead — a wrong line number means
-  the patch cannot be applied at all.
-- **Every hunk must contain an actual change.** Never output a hunk whose
-  removed line(s) and added line(s) are identical — that is a no-op and
-  will be rejected before being applied. If your intended change and the
-  ground truth already match, there is nothing to do; say so in the
-  summary instead of emitting an empty diff.
-- Include enough surrounding context lines (at least 2-3) for the patch to
-  be located unambiguously in the real file.
+**Use `diffs` only for large existing files that were NOT supplied as
+ground truth** (i.e. files too large to have been included verbatim).
+For those, unified diff hunk headers must exactly match the real file's
+line positions -- if you are not fully certain of exact line numbers,
+do not guess; set `blocked=true` and explain that the file is too large
+to edit safely without ground truth.
 
-For a file that is BRAND NEW (does not exist in the ground truth or the
-repo), output its full content directly under `new_files` — there is
-nothing to diff against.
-
+For a file that is BRAND NEW, output its full content under `new_files`.
 ## Required output — return ONLY this JSON
 
 ```json
