@@ -15,7 +15,6 @@ MENU = """
 0. Exit
 """
 
-
 def main():
     store = LibraryStore()
 
@@ -59,12 +58,11 @@ def main():
                 print(f"{loan.isbn} borrowed by {loan.member_id}, due {loan.due_date}")
 
         elif choice == "0":
-            print("Goodbye.")
+            print("bye")
             break
 
         else:
             print("Invalid option.")
 
-
 if __name__ == "__main__":
-    main() 
+    main()
