@@ -1,38 +1,40 @@
 """
-agents/dev_agent/dev_agent.py  (v4)
+agents/dev_agent/dev_agent.py  (v5)
 
-Produces code changes only -- no git operations here. The orchestrator
-(master_agent.py) owns branching/committing/pushing/PR-creation.
+CHANGES from v4 (both found from a real failure log, not hypothetical):
 
-CHANGE from v3: fixes the "Dev Agent wipes the whole file and writes a
-half-baked generic replacement" bug.
+  1. _guess_target_files() used os.listdir(repo_root) -- NON-RECURSIVE.
+     Any target file not sitting directly at the repo root (e.g. inside
+     a package subfolder) was invisible to the ground-truth heuristic,
+     silently fell back to "(no exact file content available)", and the
+     model guessed anyway instead of honoring "set blocked=true" --
+     which is exactly what produced a diff that replaced
+     `elif choice == "0":` with the identical line, while treating
+     print("bye") as already-existing context instead of the actual
+     current print("Goodbye."). Fixed: os.walk() over the whole repo
+     (excluding platform/junk dirs), matching either the bare filename
+     or the full relative path against the task text.
 
-Root cause: the KB's context_selector only returns symbol SIGNATURES and
-short docstrings, never actual file content. When a task asked for a
-full-file rewrite (new_files), the model had nothing real to reproduce,
-so it hallucinated a plausible-looking but completely different file
-(e.g. replacing a LibraryStore-backed CLI with a generic "Option 1 /
-Option 2 / Quit" menu).
+  2. NEW: ground-truth enforcement at apply time, not just prompt time.
+     Every existing file the model tries to touch (via new_files OR
+     diffs) is now checked against the set of files that were ACTUALLY
+     shown to the model as ground truth. If a file exists on disk but
+     wasn't in that set, the edit is refused with a clear error instead
+     of trusted blindly -- this doesn't rely on the model reliably
+     following "don't guess" instructions, which it demonstrably
+     doesn't always do.
 
-Two independent fixes, both required:
-    1. GROUND TRUTH INJECTION -- before calling the model, read the exact
-       current content of any file plausibly targeted by the task (any
-       .py filename literally mentioned in the task text) directly off
-       disk, and inject it into the user prompt as non-negotiable ground
-       truth, separate from the KB's symbol-level context.
-    2. REWRITE GUARD -- after the model responds, if it returned a
-       new_files entry for a file that already exists on disk, compare
-       the new content against the original with difflib. If similarity
-       falls below a threshold, treat it as a hallucinated rewrite and
-       BLOCK instead of silently committing it. A legitimate small
-       change to an existing file should score very high; a full
-       reinvention scores low.
+  3. NEW: _diff_is_meaningful() rejects a diff BEFORE calling git apply
+     if its removed and added lines are identical (a no-op edit). This
+     specific failure mode is dangerous precisely because a no-op diff
+     with a CORRECT hunk header would apply successfully and silently
+     do nothing -- the "patch does not apply" error in the log was
+     lucky; a slightly different line-number miscount would not have
+     been.
 
-Editing mechanism (see agents/common/patch_apply.py):
-    - Existing files: LLM outputs a unified diff -> applied via `git apply`.
-    - New/rewritten files: LLM outputs full content -> written directly,
-      but guarded by _validate_preserves_structure() when the file
-      already existed.
+Editing mechanism unchanged: diffs -> git apply, new/rewritten files ->
+written directly, guarded by _validate_preserves_structure() when the
+file already existed.
 """
 
 import difflib
@@ -40,7 +42,8 @@ import json
 import os
 import sys
 import time
-from typing import Any, Dict, List, Optional
+from collections import Counter
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 _AGENTS_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(_AGENTS_ROOT, "common"))
@@ -59,6 +62,14 @@ GROUND_TRUTH_MAX_CHARS_PER_FILE = 6000
 GROUND_TRUTH_MAX_FILES = 4
 REWRITE_SIMILARITY_FLOOR = 0.5
 
+# Directories the Dev Agent should never scan into: platform code it must
+# never touch (agents/, .github/), VCS internals, and junk that could
+# make the recursive walk slow or pull in noise.
+_EXCLUDED_DIR_NAMES = {
+    ".git", ".github", "agents", "__pycache__", "node_modules",
+    ".venv", "venv", ".review_agent_cache", ".mypy_cache", ".pytest_cache",
+}
+
 
 def _read_existing_file(repo_root: str, rel_path: str, max_chars: int = GROUND_TRUTH_MAX_CHARS_PER_FILE) -> Optional[str]:
     full_path = os.path.join(repo_root, rel_path)
@@ -75,37 +86,51 @@ def _read_existing_file(repo_root: str, rel_path: str, max_chars: int = GROUND_T
 
 
 def _guess_target_files(task_text: str, repo_root: str) -> List[str]:
-    """Heuristic: any top-level .py filename literally named in the task
-    text is almost certainly a file the Dev Agent is about to touch, and
-    MUST be shown to the model verbatim rather than left to guesswork.
-    Deliberately simple and over-inclusive -- a false positive just means
-    one extra file gets included in the prompt as ground truth, which is
-    harmless; a false negative is what causes hallucinated rewrites."""
-    candidates = []
-    for entry in sorted(os.listdir(repo_root)):
-        full_path = os.path.join(repo_root, entry)
-        if not os.path.isfile(full_path):
-            continue
-        if not entry.endswith(".py"):
-            continue
-        if entry in task_text:
-            candidates.append(entry)
-    return candidates[:GROUND_TRUTH_MAX_FILES]
+    """Heuristic: any .py file anywhere in the repo whose bare filename OR
+    full relative path is literally named in the task text is almost
+    certainly a file the Dev Agent is about to touch, and MUST be shown
+    to the model verbatim rather than left to guesswork.
+
+    Recursive (os.walk), not just the repo root -- a file living in a
+    subfolder used to be invisible to this heuristic entirely, which is
+    what let a hallucinated rewrite through undetected.
+
+    Deliberately over-inclusive -- a false positive just means one extra
+    file gets shown as ground truth (harmless); a false negative is what
+    causes hallucinated rewrites."""
+    candidates: List[str] = []
+    for dirpath, dirnames, filenames in os.walk(repo_root):
+        dirnames[:] = [d for d in dirnames if d not in _EXCLUDED_DIR_NAMES and not d.startswith(".")]
+        for filename in sorted(filenames):
+            if not filename.endswith(".py"):
+                continue
+            rel_path = os.path.relpath(os.path.join(dirpath, filename), repo_root).replace(os.sep, "/")
+            if filename in task_text or rel_path in task_text:
+                candidates.append(rel_path)
+                if len(candidates) >= GROUND_TRUTH_MAX_FILES:
+                    return candidates
+    return candidates
 
 
-def _build_ground_truth_block(repo_root: str, target_files: List[str]) -> str:
+def _build_ground_truth_block(repo_root: str, target_files: List[str]) -> Tuple[str, Set[str]]:
+    """Returns (rendered prompt block, set of rel_paths actually verified).
+    The verified set is what apply-time enforcement checks against --
+    it's the ground truth for "was this file's real content ever shown
+    to the model", independent of what the model claims to have done."""
     blocks = []
+    verified: Set[str] = set()
     for rel_path in target_files:
         content = _read_existing_file(repo_root, rel_path)
         if content is None:
             continue
+        verified.add(rel_path)
         blocks.append(
             f"### EXACT CURRENT CONTENT of {rel_path} (ground truth -- do not deviate)\n"
             f"```python\n{content}\n```"
         )
     if not blocks:
-        return "(no exact file content available -- do not guess at file structure; set blocked=true instead)"
-    return "\n\n".join(blocks)
+        return "(no exact file content available -- do not guess at file structure; set blocked=true instead)", verified
+    return "\n\n".join(blocks), verified
 
 
 def _validate_preserves_structure(original: str, rewritten: str, min_similarity: float = REWRITE_SIMILARITY_FLOOR) -> bool:
@@ -118,6 +143,22 @@ def _validate_preserves_structure(original: str, rewritten: str, min_similarity:
         return True
     ratio = difflib.SequenceMatcher(None, original, rewritten).ratio()
     return ratio >= min_similarity
+
+
+def _diff_is_meaningful(diff_text: str) -> bool:
+    """Reject a diff whose hunks contain no actual content change -- every
+    removed line has an identical added-line counterpart (as a multiset,
+    so reordering doesn't fool it). This is exactly the failure seen in
+    production: a hunk that replaces `elif choice == "0":` with the
+    identical line. Rejecting this BEFORE calling git apply matters
+    because a no-op diff with a numerically-correct hunk header would
+    apply cleanly and silently do nothing -- catching it only via a
+    'patch does not apply' error is luck, not a guarantee."""
+    removed = [line[1:] for line in diff_text.splitlines() if line.startswith("-") and not line.startswith("---")]
+    added = [line[1:] for line in diff_text.splitlines() if line.startswith("+") and not line.startswith("+++")]
+    if not removed and not added:
+        return False
+    return Counter(removed) != Counter(added)
 
 
 def run(
@@ -141,7 +182,7 @@ def run(
         kb_context = "(knowledge base not yet built -- run build_kb.py first)"
 
     target_files = _guess_target_files(task_text, repo_root)
-    ground_truth_block = _build_ground_truth_block(repo_root, target_files)
+    ground_truth_block, verified_ground_truth_files = _build_ground_truth_block(repo_root, target_files)
 
     user_prompt = (
         f"## Task\n{task_text}\n\n"
@@ -191,6 +232,15 @@ def run(
 
         existing_content = _read_existing_file(repo_root, rel_path, max_chars=1_000_000)
 
+        if existing_content is not None and rel_path not in verified_ground_truth_files:
+            apply_errors.append(
+                f"{rel_path}: refusing to overwrite -- this file exists but its exact "
+                f"content was never shown to the model as ground truth (missed by the "
+                f"task-text file heuristic), so a full-file replacement here would be "
+                f"an unverified guess."
+            )
+            continue
+
         if existing_content is not None:
             if not _validate_preserves_structure(existing_content, content):
                 apply_errors.append(
@@ -210,6 +260,24 @@ def run(
     for rel_path, diff_text in diffs.items():
         if rel_path.startswith("agents/") or rel_path.startswith(".github/"):
             continue
+
+        existing_content = _read_existing_file(repo_root, rel_path, max_chars=1_000_000)
+        if existing_content is not None and rel_path not in verified_ground_truth_files:
+            apply_errors.append(
+                f"{rel_path}: refusing to apply diff -- this file's exact content was "
+                f"never shown to the model as ground truth, so the diff's context lines "
+                f"can't be trusted to match the real file."
+            )
+            continue
+
+        if not _diff_is_meaningful(diff_text):
+            apply_errors.append(
+                f"{rel_path}: diff rejected -- added and removed lines are identical "
+                f"(no-op edit). This usually means the model didn't actually have the "
+                f"real file content and hallucinated a plausible-looking but empty change."
+            )
+            continue
+
         success, message = apply_unified_diff(repo_root, diff_text)
         if success:
             changed_files.append(rel_path)
