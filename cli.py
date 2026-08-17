@@ -1,8 +1,8 @@
-"""
-Legacy code (dummy, for POC purposes).
+# This script serves as the main entry point for the Library Management System, providing an interactive terminal interface for users to manage library operations.
+# It utilizes the LibraryStore class to perform various actions such as adding books, registering members, borrowing and returning books, and listing available books and overdue loans.
+"""Legacy code (dummy, for POC purposes).
 Library Management System - interactive terminal entry point.
 """
-
 from storage import LibraryStore
 
 MENU = """
@@ -14,7 +14,6 @@ MENU = """
 6. Show overdue loans
 0. Exit
 """
-
 
 def main():
     store = LibraryStore()
@@ -64,7 +63,6 @@ def main():
 
         else:
             print("Invalid option.")
-
 
 if __name__ == "__main__":
     main() 
