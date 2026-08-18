@@ -192,7 +192,7 @@ def run(
     db_path: str,
     allocated_budget_tokens: int,
     model: str = DEFAULT_MODEL,
-    max_output_tokens: int = 1500,
+    max_output_tokens: int = 2500,
 ) -> Dict[str, Any]:
     start_time = time.time()
 
