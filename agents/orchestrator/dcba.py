@@ -23,7 +23,7 @@ from dataclasses import dataclass
 from typing import Dict, List, Optional
 
 MIN_BUDGET_PER_AGENT = 800
-DEFAULT_TOTAL_BUDGET = 9000  # keep comfortably under a 12,000 TPM ceiling
+DEFAULT_TOTAL_BUDGET = 1000  # keep comfortably under a 12,000 TPM ceiling
 
 SECURITY_SENSITIVE_HINTS = (
     "auth", "secret", "password", "token", "crypto", "permission",
