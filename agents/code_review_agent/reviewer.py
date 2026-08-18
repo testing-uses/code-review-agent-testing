@@ -48,7 +48,7 @@ def review_pull_request(
     repo_root: str,
     changed_files: List[str],
     context_text: str,
-    model: str = "llama-3.3-70b-versatile",
+    model: str = "openai/gpt-oss-120b",
     max_output_tokens: int = 1800,
     token_ceiling: int = 6000,
 ) -> Dict[str, Any]:

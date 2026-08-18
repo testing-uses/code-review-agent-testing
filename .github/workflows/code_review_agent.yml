@@ -58,4 +58,4 @@ jobs:
             --repo-full-name "${{ github.repository }}" \
             --pr-number "${{ github.event.pull_request.number }}" \
             --db-path agents/knowledge_base/kb.sqlite3 \
-            --model llama-3.3-70b-versatile
+            --model openai/gpt-oss-120b

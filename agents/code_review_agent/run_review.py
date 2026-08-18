@@ -85,7 +85,7 @@ def run_review_for_pr(
     pr_number: int,
     budget_tokens: int = 3000,
     db_path: str = None,
-    model: str = "llama-3.3-70b-versatile",
+    model: str = "openai/gpt-oss-120b",
     post_to_github: bool = True,
 ) -> dict:
     """The function master_agent.py has been trying to import all along.
@@ -167,7 +167,7 @@ def main():
     parser.add_argument("--head-sha", required=True)
     parser.add_argument("--repo-full-name", required=True)
     parser.add_argument("--pr-number", type=int, required=True)
-    parser.add_argument("--model", default="llama-3.3-70b-versatile")
+    parser.add_argument("--model", default="openai/gpt-oss-120b")
     parser.add_argument("--context-token-budget", type=int, default=3000)
     parser.add_argument("--db-path", default=os.path.join(KB_DIR, "kb.sqlite3"))
     args = parser.parse_args()
