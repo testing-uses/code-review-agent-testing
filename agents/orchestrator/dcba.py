@@ -1,20 +1,19 @@
 """
-agents/orchestrator/dcba.py  (v2 — two-phase allocation)
+agents/orchestrator/dcba.py (v3 -- raised budget floor)
 
-Dynamic Context Budget Allocation (DCBA).
+CHANGE from v2: MIN_BUDGET_PER_AGENT and DEFAULT_TOTAL_BUDGET were sized
+for the retired llama-3.3-70b-versatile-era prompts. The current
+dev_agent_prompt.md system prompt alone is ~2,325 tokens, and a ground-
+truth file block can be up to ~1,800 tokens on top of that -- a ~5,000
+token ceiling can never fit system prompt + ground truth + a reasonable
+output allowance simultaneously, regardless of how well context is
+trimmed. Raised both constants so a single-file, ground-truth-driven
+edit fits with room to spare. Verify DEFAULT_TOTAL_BUDGET against your
+actual Groq plan's TPM (tokens-per-minute) limit before deploying --
+this value assumes a plan with at least ~24,000 TPM headroom.
 
-Phase 1 (unchanged): softmax-weighted split of the total budget across
-agents by complexity score, computed BEFORE the Dev Agent has run. This
-is necessarily a guess for the review agent's side — you don't know the
-diff size or whether it touches anything sensitive before it exists.
-
-Phase 2 (NEW — reallocate_review_budget): once the Dev Agent has actually
-produced a diff, replace that guess with real signals — actual files/
-lines changed, whether the diff touches anything that looks security-
-sensitive — and cap the review agent's budget by what's ACTUALLY left of
-the shared ceiling after the Dev Agent's real usage, not its original
-estimate. This is what actually protects the shared Groq TPM limit;
-phase 1 alone only protects against two budgets that were both guesses.
+Everything else (two-phase allocation, EMA correction, phase-2
+reallocation using real diff signals) is unchanged from v2.
 """
 
 import math
@@ -22,8 +21,8 @@ import subprocess
 from dataclasses import dataclass
 from typing import Dict, List, Optional
 
-MIN_BUDGET_PER_AGENT = 800
-DEFAULT_TOTAL_BUDGET = 10000  # keep comfortably under a 12,000 TPM ceiling
+MIN_BUDGET_PER_AGENT = 2000
+DEFAULT_TOTAL_BUDGET = 11000  # verify against your Groq plan's actual TPM limit
 
 SECURITY_SENSITIVE_HINTS = (
     "auth", "secret", "password", "token", "crypto", "permission",
@@ -101,7 +100,7 @@ def update_ema(previous_ema: Optional[float], latest_actual: int, alpha: float =
 
 
 def diff_line_count(repo_root: str, base_sha: str, head_sha: str, changed_files: List[str]) -> int:
-    """Total added+removed lines across the reviewable diff — the real
+    """Total added+removed lines across the reviewable diff -- the real
     'lines_changed' signal, vs. the hardcoded 20 the review agent's budget
     used to be computed from."""
     if not changed_files:
@@ -134,16 +133,12 @@ def reallocate_review_budget(
     review_ema: Optional[float],
     min_budget: int = MIN_BUDGET_PER_AGENT,
 ) -> int:
-    """Phase 2. Call this AFTER the PR is created — real diff, real
+    """Phase 2. Call this AFTER the PR is created -- real diff, real
     complexity, real remaining budget.
 
     Caps the review agent at whatever's actually left of the shared
-    ceiling after what the Dev Agent actually used (not its allocation —
-    agents routinely use less than they're given), so a big Dev Agent
-    call doesn't leave the review agent starved for no reason, and a
-    small one doesn't get treated the same as a 40-file security-touching
-    diff, which is what the static ComplexitySignals(files_changed=1,
-    lines_changed=20) placeholder was doing before."""
+    ceiling after what the Dev Agent actually used (not its allocation --
+    agents routinely use less than they're given)."""
     signals = ComplexitySignals(
         files_changed=len(changed_files),
         lines_changed=diff_line_count(repo_root, base_sha, head_sha, changed_files),
@@ -154,9 +149,6 @@ def reallocate_review_budget(
 
     remaining_budget = max(total_budget - dev_actual_tokens_used, min_budget)
 
-    # score=40 already reflects a large, security-touching diff — cap the
-    # growth curve there so one huge PR can't claim the entire remaining
-    # budget and leave nothing as a floor.
     scale = min(score / 40.0, 1.0)
     raw_budget = max(int(remaining_budget * scale), min_budget)
     raw_budget = min(raw_budget, remaining_budget)

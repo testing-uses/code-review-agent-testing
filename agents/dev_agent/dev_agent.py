@@ -1,55 +1,56 @@
 """
-agents/dev_agent/dev_agent.py (v6)
+agents/dev_agent/dev_agent.py (v7)
 
 Produces code changes only -- no git operations here. The orchestrator
 (master_agent.py) owns branching/committing/pushing/PR-creation.
 
-CHANGES from v5 (both found from real failure logs, not hypothetical):
+CHANGE from v6 (root-caused from a real preflight failure log):
 
-1. NEW: diffs are now rejected outright for any file supplied as ground
-   truth, and must instead be returned via new_files with the complete
-   content. Three separate real failures (wrong line targeted, synthetic
-   no-op hunk, context/indentation mismatch) showed unified-diff
-   generation from this model is not reliable enough to trust for small
-   files we already have exact content for. Full-file replacement is
-   protected by _validate_preserves_structure() instead of git apply's
-   strict line-count/context matching.
+The v6 defaults could never fit inside a realistic DCBA-allocated ceiling:
+system prompt (~2,325 tokens) + a full ground-truth file (~1,800 tokens)
++ max_output_tokens (2,500) already exceeds a ~5,000 token ceiling before
+KB context or the task text are even added. Two changes fix this without
+touching output reliability:
 
-2. NEW: call_groq_json() is now wrapped in a try/except for Groq's own
-   BadRequestError (json_validate_failed). A real run crashed the entire
-   GitHub Actions job with an unhandled traceback because the model tried
-   to embed a full Python file -- including its own triple-quoted
-   docstring -- as a single JSON string and got the escaping wrong. This
-   is now caught and converted into a clean BLOCKED result instead of a
-   pipeline crash.
+1. KB context is now SKIPPED ENTIRELY whenever ground truth already found
+   the target file(s). Every real run logged so far shows
+   matched_context_entries=0 -- the KB signature search has never once
+   contributed anything useful for these tasks, so spending part of the
+   budget on it when we already have the exact file is pure waste. KB
+   context is only requested when NO ground-truth file was found, as a
+   fallback for the model to at least have something.
 
-3. NEW: new_files content may now be a JSON array of lines instead of one
-   big string with embedded newlines/quotes. This is what actually
-   prevents the JSON-escaping crash in (2) from happening in the first
-   place -- per-line strings are trivial for the model to escape
-   correctly; one giant multi-line string containing its own quotes and
-   triple-quotes is not. _normalize_file_content() joins the array with
-   "\n"; a plain string is still accepted for backward compatibility.
+2. If preflight_check still rejects the prompt as too large, retry ONCE
+   with a compact prompt (KB context dropped, ground truth kept -- ground
+   truth is what actually lets the model do a safe edit) BEFORE giving up.
+   This retry no longer shrinks max_output_tokens (a prior version did,
+   which caused a *different* real failure: the model's output got
+   truncated mid-JSON because the line-array format needs more output
+   tokens per line than a single string, not fewer).
 
-Carried over from v5 (still required, still correct):
-    - _guess_target_files() recursively walks the whole repo (os.walk),
-      not just the repo root, so files in subfolders aren't invisible to
-      the ground-truth heuristic.
-    - Ground-truth enforcement at APPLY time, not just prompt time: any
-      existing file the model touches must have been actually shown to it
-      as ground truth, regardless of what the model claims.
-    - _diff_is_meaningful() rejects a no-op diff (identical removed/added
-      lines) before calling git apply.
-    - _validate_preserves_structure() rejects a new_files rewrite of an
-      existing file if it's too dissimilar to the original (hallucinated
-      rewrite guard).
+max_output_tokens default lowered from 2500 to 1800 -- calibrated against
+the real truncation and success logs seen so far, this is enough for a
+~50-line file in line-array format with escaping overhead, without
+needlessly inflating the ceiling DCBA has to clear.
+
+Everything else carried over from v6, unchanged:
+- diffs are rejected for any file supplied as ground truth; must use
+  new_files with full content instead.
+- call_groq_json() BadRequestError (json_validate_failed) is caught and
+  converted to a clean BLOCKED result instead of crashing the pipeline.
+- new_files values may be a JSON array of lines (preferred) or a plain
+  string (backward compatible), normalized by _normalize_file_content().
+- _guess_target_files() recursively walks the whole repo.
+- Ground-truth enforcement at APPLY time, not just prompt time.
+- _diff_is_meaningful() rejects no-op diffs before calling git apply.
+- _validate_preserves_structure() rejects hallucinated full rewrites.
 
 Editing mechanism:
-    - Files supplied as ground truth: MUST use new_files (full content),
-      never diffs. Guarded by _validate_preserves_structure().
-    - Existing files NOT supplied as ground truth: diffs only, applied via
-      `git apply`, guarded by _diff_is_meaningful().
-    - Brand-new files: new_files, written directly.
+- Files supplied as ground truth: MUST use new_files (full content),
+  never diffs. Guarded by _validate_preserves_structure().
+- Existing files NOT supplied as ground truth: diffs only, applied via
+  `git apply`, guarded by _diff_is_meaningful().
+- Brand-new files: new_files, written directly.
 """
 
 import difflib
@@ -77,9 +78,6 @@ GROUND_TRUTH_MAX_CHARS_PER_FILE = 6000
 GROUND_TRUTH_MAX_FILES = 4
 REWRITE_SIMILARITY_FLOOR = 0.5
 
-# Directories the Dev Agent should never scan into: platform code it must
-# never touch (agents/, .github/), VCS internals, and junk that could make
-# the recursive walk slow or pull in noise.
 _EXCLUDED_DIR_NAMES = {
     ".git", ".github", "agents", "__pycache__", "node_modules",
     ".venv", "venv", ".review_agent_cache", ".mypy_cache", ".pytest_cache",
@@ -104,14 +102,8 @@ def _guess_target_files(task_text: str, repo_root: str) -> List[str]:
     """Heuristic: any .py file anywhere in the repo whose bare filename OR
     full relative path is literally named in the task text is almost
     certainly a file the Dev Agent is about to touch, and MUST be shown
-    to the model verbatim rather than left to guesswork.
-
-    Recursive (os.walk), not just the repo root -- a file living in a
-    subfolder used to be invisible to this heuristic entirely.
-
-    Deliberately over-inclusive -- a false positive just means one extra
-    file gets shown as ground truth (harmless); a false negative is what
-    causes hallucinated rewrites."""
+    to the model verbatim rather than left to guesswork. Recursive
+    (os.walk), deliberately over-inclusive."""
     candidates: List[str] = []
     for dirpath, dirnames, filenames in os.walk(repo_root):
         dirnames[:] = [d for d in dirnames if d not in _EXCLUDED_DIR_NAMES and not d.startswith(".")]
@@ -128,9 +120,7 @@ def _guess_target_files(task_text: str, repo_root: str) -> List[str]:
 
 def _build_ground_truth_block(repo_root: str, target_files: List[str]) -> Tuple[str, Set[str]]:
     """Returns (rendered prompt block, set of rel_paths actually verified).
-    The verified set is what apply-time enforcement checks against -- it's
-    the ground truth for "was this file's real content ever shown to the
-    model", independent of what the model claims to have done."""
+    The verified set is what apply-time enforcement checks against."""
     blocks = []
     verified: Set[str] = set()
     for rel_path in target_files:
@@ -148,11 +138,8 @@ def _build_ground_truth_block(repo_root: str, target_files: List[str]) -> Tuple[
 
 
 def _validate_preserves_structure(original: str, rewritten: str, min_similarity: float = REWRITE_SIMILARITY_FLOOR) -> bool:
-    """A legitimate small edit to an existing file should be near-identical
-    to the original. A hallucinated from-scratch rewrite will score low.
-    This is a coarse, deliberately conservative safety net -- it can't
-    tell you the edit is CORRECT, only that it isn't a wholesale
-    replacement of the file's actual structure."""
+    """A legitimate small edit should be near-identical to the original.
+    A hallucinated from-scratch rewrite will score low."""
     if not original:
         return True
     ratio = difflib.SequenceMatcher(None, original, rewritten).ratio()
@@ -160,12 +147,7 @@ def _validate_preserves_structure(original: str, rewritten: str, min_similarity:
 
 
 def _diff_is_meaningful(diff_text: str) -> bool:
-    """Reject a diff whose hunks contain no actual content change -- every
-    removed line has an identical added-line counterpart (as a multiset,
-    so reordering doesn't fool it). A no-op diff with a numerically
-    correct hunk header would apply cleanly and silently do nothing --
-    catching it only via a 'patch does not apply' error is luck, not a
-    guarantee."""
+    """Reject a diff whose hunks contain no actual content change."""
     removed = [line[1:] for line in diff_text.splitlines() if line.startswith("-") and not line.startswith("---")]
     added = [line[1:] for line in diff_text.splitlines() if line.startswith("+") and not line.startswith("+++")]
     if not removed and not added:
@@ -174,45 +156,23 @@ def _diff_is_meaningful(diff_text: str) -> bool:
 
 
 def _normalize_file_content(raw_content: Any) -> str:
-    """new_files values should be a JSON array of lines -- this avoids the
-    model having to hand-escape a multi-line string containing its own
-    quotes/triple-quotes, which is exactly what caused a real Groq-side
-    400 json_validate_failed error (the model tried to embed a Python
-    docstring's literal \"\"\" inside one giant JSON string and broke
-    escaping). Falls back to treating the value as a plain string for
-    backward compatibility with responses that don't use the array form."""
+    """new_files values should be a JSON array of lines -- easier for the
+    model to escape correctly than one giant multi-line string. Falls
+    back to treating the value as a plain string for compatibility."""
     if isinstance(raw_content, list):
         return "\n".join(str(line) for line in raw_content)
     return str(raw_content)
 
 
-def run(
-    task_text: str,
-    repo_root: str,
-    db_path: str,
-    allocated_budget_tokens: int,
-    model: str = DEFAULT_MODEL,
-    max_output_tokens: int = 2500,
-) -> Dict[str, Any]:
-    start_time = time.time()
-
-    system_prompt = load_prompt(PROMPTS_DIR, "dev_agent_prompt.md")
-
-    context_budget = int(allocated_budget_tokens * 0.6)
-    if os.path.exists(db_path):
-        conn = get_connection(db_path)
-        kb_context = select_context(conn, task_text, budget_tokens=context_budget)
-        conn.close()
-    else:
-        kb_context = "(knowledge base not yet built -- run build_kb.py first)"
-
-    target_files = _guess_target_files(task_text, repo_root)
-    ground_truth_block, verified_ground_truth_files = _build_ground_truth_block(repo_root, target_files)
-
-    user_prompt = (
-        f"## Task\n{task_text}\n\n"
+def _build_user_prompt(task_text: str, kb_context: str, ground_truth_block: str, include_kb_context: bool) -> str:
+    kb_section = (
         f"## Relevant existing code (hybrid BM25 + vector + PageRank retrieval -- signatures only, NOT ground truth)\n"
         f"{kb_context}\n\n"
+        if include_kb_context else ""
+    )
+    return (
+        f"## Task\n{task_text}\n\n"
+        f"{kb_section}"
         f"## Exact current file content -- this IS ground truth\n"
         f"You MUST preserve every line of the files below exactly, except for the minimal\n"
         f"change the task explicitly requires. Do not invent a different program structure,\n"
@@ -223,6 +183,42 @@ def run(
         f"{ground_truth_block}"
     )
 
+
+def run(
+    task_text: str,
+    repo_root: str,
+    db_path: str,
+    allocated_budget_tokens: int,
+    model: str = DEFAULT_MODEL,
+    max_output_tokens: int = 1800,
+) -> Dict[str, Any]:
+    start_time = time.time()
+
+    system_prompt = load_prompt(PROMPTS_DIR, "dev_agent_prompt.md")
+
+    target_files = _guess_target_files(task_text, repo_root)
+    ground_truth_block, verified_ground_truth_files = _build_ground_truth_block(repo_root, target_files)
+    ground_truth_found = bool(verified_ground_truth_files)
+
+    # Skip the KB lookup entirely when ground truth already covers the
+    # target file(s) -- it has never once contributed anything useful in
+    # practice (matched_context_entries has been 0 on every real run so
+    # far) and it only costs budget we need for the exact file content.
+    if ground_truth_found:
+        kb_context = "(skipped -- ground truth already found for the target file(s))"
+    elif os.path.exists(db_path):
+        context_budget = int(allocated_budget_tokens * 0.6)
+        conn = get_connection(db_path)
+        kb_context = select_context(conn, task_text, budget_tokens=context_budget)
+        conn.close()
+    else:
+        kb_context = "(knowledge base not yet built -- run build_kb.py first)"
+
+    user_prompt = _build_user_prompt(
+        task_text, kb_context, ground_truth_block,
+        include_kb_context=not ground_truth_found,
+    )
+
     key_pool = GroqKeyPool()
 
     try:
@@ -231,6 +227,36 @@ def run(
             user_prompt=user_prompt, max_output_tokens=max_output_tokens,
             token_ceiling=allocated_budget_tokens,
         )
+    except ValueError as error:
+        if "Prompt too large" not in str(error):
+            raise
+
+        # Last resort: drop KB context entirely (even if it was already
+        # excluded) and keep only the task + ground truth. Do NOT shrink
+        # max_output_tokens here -- that caused a separate real failure
+        # (truncated mid-JSON output) in an earlier version.
+        compact_user_prompt = _build_user_prompt(
+            task_text, kb_context="", ground_truth_block=ground_truth_block,
+            include_kb_context=False,
+        )
+
+        try:
+            result = call_groq_json(
+                key_pool=key_pool, model=model, system_prompt=system_prompt,
+                user_prompt=compact_user_prompt, max_output_tokens=max_output_tokens,
+                token_ceiling=allocated_budget_tokens,
+            )
+        except ValueError as retry_error:
+            latency_ms = (time.time() - start_time) * 1000
+            return {
+                "status": "BLOCKED",
+                "blocked_reason": (
+                    f"Prompt still too large after dropping KB context: {retry_error}. "
+                    f"Raise DCBA's DEFAULT_TOTAL_BUDGET/MIN_BUDGET_PER_AGENT or reduce "
+                    f"GROUND_TRUTH_MAX_CHARS_PER_FILE."
+                ),
+                "usage": {}, "latency_ms": latency_ms,
+            }
     except BadRequestError as error:
         latency_ms = (time.time() - start_time) * 1000
         return {
@@ -267,8 +293,6 @@ def run(
     apply_errors: List[str] = []
     ground_truth_files = set(target_files)
 
-    # ---- new_files: brand-new files, or full-content edits of files that
-    # were shown to the model as ground truth ----
     for rel_path, raw_content in new_files.items():
         if rel_path.startswith("agents/") or rel_path.startswith(".github/"):
             continue
@@ -279,17 +303,14 @@ def run(
         if existing_content is not None and rel_path not in verified_ground_truth_files:
             apply_errors.append(
                 f"{rel_path}: refusing to overwrite -- this file exists but its exact "
-                f"content was never shown to the model as ground truth (missed by the "
-                f"task-text file heuristic), so a full-file replacement here would be "
-                f"an unverified guess."
+                f"content was never shown to the model as ground truth."
             )
             continue
 
         if existing_content is not None and not _validate_preserves_structure(existing_content, content):
             apply_errors.append(
                 f"{rel_path}: rewrite rejected -- new content is too dissimilar "
-                f"to the existing file (looks like a hallucinated full rewrite "
-                f"rather than a targeted edit)."
+                f"to the existing file (looks like a hallucinated full rewrite)."
             )
             continue
 
@@ -299,7 +320,6 @@ def run(
         except ValueError as error:
             apply_errors.append(f"{rel_path}: {error}")
 
-    # ---- diffs: only for existing files NOT supplied as ground truth ----
     for rel_path, diff_text in diffs.items():
         if rel_path.startswith("agents/") or rel_path.startswith(".github/"):
             continue
@@ -308,8 +328,7 @@ def run(
             apply_errors.append(
                 f"{rel_path}: diffs are not permitted for files supplied as "
                 f"ground truth -- resubmit using new_files with the complete "
-                f"file content instead. This file's diff was rejected before "
-                f"being sent to git apply."
+                f"file content instead."
             )
             continue
 
@@ -317,16 +336,14 @@ def run(
         if existing_content is not None and rel_path not in verified_ground_truth_files:
             apply_errors.append(
                 f"{rel_path}: refusing to apply diff -- this file's exact content was "
-                f"never shown to the model as ground truth, so the diff's context lines "
-                f"can't be trusted to match the real file."
+                f"never shown to the model as ground truth."
             )
             continue
 
         if not _diff_is_meaningful(diff_text):
             apply_errors.append(
                 f"{rel_path}: diff rejected -- added and removed lines are identical "
-                f"(no-op edit). This usually means the model didn't actually have the "
-                f"real file content and hallucinated a plausible-looking but empty change."
+                f"(no-op edit)."
             )
             continue
 
