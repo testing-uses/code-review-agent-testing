@@ -71,7 +71,7 @@ from context_selector import select_context  # noqa: E402
 from kb_schema import get_connection  # noqa: E402
 
 PROMPTS_DIR = os.path.join(os.path.dirname(__file__), "..", "prompts")
-DEFAULT_MODEL = "llama-3.3-70b-versatile"
+DEFAULT_MODEL = "openai/gpt-oss-120b"
 
 GROUND_TRUTH_MAX_CHARS_PER_FILE = 6000
 GROUND_TRUTH_MAX_FILES = 4

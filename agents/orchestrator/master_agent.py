@@ -44,7 +44,7 @@ import dev_agent  # noqa: E402
 
 PROMPTS_DIR = os.path.join(os.path.dirname(__file__), "..", "prompts")
 METRICS_PATH = os.path.join(os.path.dirname(__file__), "metrics.jsonl")
-DEFAULT_MODEL = "llama-3.3-70b-versatile"
+DEFAULT_MODEL = "openai/gpt-oss-120b"
 
 
 def emit(event: str, **details) -> dict:
