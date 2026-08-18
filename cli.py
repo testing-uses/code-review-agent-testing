@@ -1,3 +1,6 @@
+# CLI entry point for the Library Management System
+# Provides interactive menu for managing books and members
+# (c) 2023 Example Corp
 """
 Legacy code (dummy, for POC purposes).
 Library Management System - interactive terminal entry point.
