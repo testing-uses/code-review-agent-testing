@@ -309,18 +309,20 @@ def _call_provider(
     allocated_budget_tokens: int,
 ) -> Dict[str, Any]:
     if provider == "cerebras":
+        cerebras_model = os.getenv(
+            "CEREBRAS_MODEL",
+            "gpt-oss-120b",
+        )
+
         return call_cerebras_json(
-            model=os.getenv(
-                "CEREBRAS_MODEL",
-                "gpt-oss-120b",
-                model,
-            ),
+            model=cerebras_model,
             system_prompt=system_prompt,
             user_prompt=user_prompt,
             max_output_tokens=max_output_tokens,
         )
 
     key_pool = GroqKeyPool()
+
     return call_groq_json(
         key_pool=key_pool,
         model=model,
@@ -330,7 +332,6 @@ def _call_provider(
         token_ceiling=allocated_budget_tokens,
         response_schema=DEV_AGENT_RESPONSE_SCHEMA,
     )
-
 
 def run(
     task_text: str,
