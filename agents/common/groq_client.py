@@ -1,23 +1,7 @@
-"""agents/common/groq_client.py  (v2)
+"""agents/common/groq_client.py
 
-CHANGES:
-  - DEV_AGENT_RESPONSE_SCHEMA restructured: diffs/new_files were
-    `{"type": "object", "additionalProperties": {"type": "string"}}` --
-    an arbitrary-key dictionary pattern. Groq's strict JSON Schema mode
-    requires additionalProperties to be exactly `false` on every object
-    with every property enumerated by name -- it structurally cannot
-    express "arbitrary file path -> string". That's not a prompt issue,
-    it's an invalid schema, and it fails identically on every attempt.
-    Fixed by switching to arrays of {"path": ..., "content"/"diff": ...}
-    objects, which strict mode supports natively (every object has a
-    fixed, fully-enumerated property set).
-  - Retry logic no longer retries HTTP 400/401. Those are deterministic
-    (invalid schema, malformed request, bad auth) -- retrying reproduces
-    the identical failure on every key and just burns attempts while
-    hiding the real error behind "All Groq attempts failed after N
-    attempts". Only 429/500/502/503/504 and connection errors are
-    retried now; 400/401 raise immediately with the real message (plus
-    a targeted hint for the two error shapes seen in practice).
+Provider client used by the pipeline. Existing Groq behavior is preserved;
+Cerebras is added as an optional provider for Dev Agent calls.
 """
 
 from __future__ import annotations
@@ -43,12 +27,6 @@ load_dotenv(dotenv_path=ENV_FILE)
 
 CHARS_PER_TOKEN_ESTIMATE = 3.3
 
-# Strict JSON Schema mode (Groq/OpenAI-compatible) requires:
-#   - additionalProperties: false on every object, with no exceptions
-#   - every property enumerated by name -- no arbitrary/dynamic keys
-# A dict keyed by unknown file paths cannot be expressed this way, so
-# new_files/diffs are arrays of fixed-shape {path, content|diff} objects
-# instead of objects keyed by path.
 DEV_AGENT_RESPONSE_SCHEMA = {
     "type": "object",
     "additionalProperties": False,
@@ -165,25 +143,86 @@ def _response_format(response_schema: Optional[dict]) -> dict:
     }
 
 
-_NON_RETRYABLE_STATUS_CODES = {400, 401}
-_RETRYABLE_STATUS_CODES = {429, 500, 502, 503, 504}
+def _extract_result(response: Any, provider: str) -> Dict[str, Any]:
+    content = response.choices[0].message.content or ""
+
+    if not content.strip():
+        raise RuntimeError(
+            f"{provider} returned an empty JSON generation."
+        )
+
+    result = json.loads(content)
+    if not isinstance(result, dict):
+        raise RuntimeError(
+            f"{provider} returned JSON, but it was not an object."
+        )
+
+    usage = getattr(response, "usage", None)
+    result["_usage"] = {
+        "prompt_tokens": getattr(
+            usage,
+            "prompt_tokens",
+            None,
+        ),
+        "completion_tokens": getattr(
+            usage,
+            "completion_tokens",
+            None,
+        ),
+        "total_tokens": getattr(
+            usage,
+            "total_tokens",
+            None,
+        ),
+        "provider": provider,
+    }
+    return result
 
 
-def _diagnostic_hint(message: str) -> str:
-    if "additionalProperties" in message:
-        return (
-            " -- the response_schema itself is invalid for strict mode: "
-            "every object must set additionalProperties=false and enumerate "
-            "all properties by name (no arbitrary/dynamic keys)."
-        )
-    if "json_validate_failed" in message:
-        return (
-            " -- the model's generation didn't satisfy the schema before "
-            "running out of room. This usually means max_output_tokens is "
-            "too small for the required response (e.g. a full file rewrite "
-            "plus JSON/schema overhead) -- increase the output token budget."
-        )
-    return ""
+def call_cerebras_json(
+    model: str,
+    system_prompt: str,
+    user_prompt: str,
+    max_output_tokens: int,
+) -> Dict[str, Any]:
+    """Call Cerebras through its OpenAI-compatible API."""
+    try:
+        from openai import OpenAI
+    except ImportError as error:
+        raise RuntimeError(
+            "Cerebras support requires the 'openai' package. "
+            "Install it with: pip install openai"
+        ) from error
+
+    api_key = os.getenv("CEREBRAS_API_KEY")
+    if not api_key:
+        raise RuntimeError("CEREBRAS_API_KEY is not configured.")
+
+    client = OpenAI(
+        api_key=api_key,
+        base_url="https://api.cerebras.ai/v1",
+    )
+
+    response = client.chat.completions.create(
+        model=model,
+        messages=[
+            {
+                "role": "system",
+                "content": system_prompt,
+            },
+            {
+                "role": "user",
+                "content": user_prompt,
+            },
+        ],
+        temperature=0,
+        max_tokens=max_output_tokens,
+        # Cerebras is called with generic JSON mode here. Python-side
+        # validation remains the final contract enforcement layer.
+        response_format={"type": "json_object"},
+    )
+
+    return _extract_result(response, "cerebras")
 
 
 def call_groq_json(
@@ -228,39 +267,10 @@ def call_groq_json(
                 response_format=_response_format(response_schema),
             )
 
-            content = response.choices[0].message.content or ""
-            if not content.strip():
-                raise RuntimeError(
-                    "Groq returned an empty JSON generation."
-                )
-
-            result = json.loads(content)
-            if not isinstance(result, dict):
-                raise RuntimeError(
-                    "Groq returned JSON, but it was not an object."
-                )
-
+            result = _extract_result(response, "groq")
+            result["_usage"]["key_index"] = key_index
+            result["_usage"]["attempt"] = attempt + 1
             key_pool.mark_success(key_index)
-            usage = getattr(response, "usage", None)
-            result["_usage"] = {
-                "prompt_tokens": getattr(
-                    usage,
-                    "prompt_tokens",
-                    None,
-                ),
-                "completion_tokens": getattr(
-                    usage,
-                    "completion_tokens",
-                    None,
-                ),
-                "total_tokens": getattr(
-                    usage,
-                    "total_tokens",
-                    None,
-                ),
-                "key_index": key_index,
-                "attempt": attempt + 1,
-            }
             return result
 
         except RateLimitError as error:
@@ -270,20 +280,26 @@ def call_groq_json(
 
         except APIStatusError as error:
             last_error = error
-            if error.status_code in _RETRYABLE_STATUS_CODES:
+
+            if error.status_code == 413:
+                raise RuntimeError(
+                    "Groq rejected the request as too large. "
+                    "Reduce prompt/output tokens; rotating API keys will "
+                    "not reduce one request's size."
+                ) from error
+
+            if error.status_code in {400, 401}:
+                raise RuntimeError(
+                    f"Groq rejected the request (HTTP {error.status_code}): "
+                    f"{error}"
+                ) from error
+
+            if error.status_code in {429, 500, 502, 503, 504}:
                 key_pool.rotate_after_failure(key_index)
                 time.sleep(min(2 + attempt, 8))
-            elif error.status_code in _NON_RETRYABLE_STATUS_CODES:
-                # Deterministic failure -- identical on every key, every
-                # retry. Fail fast with the real cause instead of
-                # burning max_attempts to rediscover the same error.
-                message = str(error)
-                raise RuntimeError(
-                    f"Groq rejected the request (HTTP {error.status_code}, "
-                    f"non-retryable){_diagnostic_hint(message)}: {message}"
-                ) from error
-            else:
-                raise
+                continue
+
+            raise
 
         except APIConnectionError as error:
             last_error = error

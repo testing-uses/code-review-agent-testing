@@ -1,43 +1,16 @@
-"""agents/dev_agent/dev_agent.py  (v7)
+"""agents/dev_agent/dev_agent.py
 
-CHANGES from v6 (both found from a real truncation failure, not
-hypothetical):
+Dev Agent with optional Cerebras provider support.
 
-  1. REMOVED: "diffs are forbidden for exact ground-truth files". That
-     rule made every edit to a ground-truth file go through a full-file
-     rewrite, no matter the file's size -- paying token cost to show the
-     model the whole file (input) AND have it reproduce almost the whole
-     file back (output). For a large file and a one-line change, that's
-     nearly 2x the file's real token cost for nothing. The rule existed
-     to stop diffing against content the model never actually saw --
-     that risk doesn't apply once ground truth WAS shown, which is
-     exactly the case this blocked. Diffs against ground-truth files are
-     now allowed; the existing safety nets (no-op-diff rejection,
-     rewrite-similarity floor for full-file rewrites) still apply
-     regardless of which path is used.
-
-  2. max_output_tokens is no longer sized from a preliminary percentage
-     split before the prompt exists. select_context()/ground-truth are
-     still bounded by a preliminary split (so neither can unilaterally
-     eat the whole budget), but the FINAL output budget is now computed
-     from what the assembled prompt actually costs (measured with
-     estimate_tokens, not guessed) -- so budget that KB retrieval didn't
-     use (e.g. "matched_context_entries": 0, a common case) gets
-     reclaimed for the generation that actually needs it, instead of
-     being wasted while the model gets truncated mid-file.
-
-  3. If, even after reclaiming, there isn't enough budget left for a
-     viable generation, this now fails FAST with a clear blocked_reason
-     before ever calling Groq -- instead of spending an API call to
-     rediscover the same truncation failure the math already predicted.
-
-  4. DEFAULT_MODEL is now overridable via the DEV_AGENT_MODEL env var,
-     so a different Groq model can be tried without a code change.
+Existing Groq behavior remains available. Set DEV_AGENT_PROVIDER=cerebras
+and CEREBRAS_API_KEY to use Cerebras for the Dev Agent only. The rest of the
+workflow is unchanged.
 """
 
 from __future__ import annotations
 
 import difflib
+import json
 import os
 import sys
 import time
@@ -56,6 +29,7 @@ from groq_client import (  # noqa: E402
     CHARS_PER_TOKEN_ESTIMATE,
     DEV_AGENT_RESPONSE_SCHEMA,
     GroqKeyPool,
+    call_cerebras_json,
     call_groq_json,
     estimate_tokens,
     load_prompt,
@@ -64,20 +38,22 @@ from kb_schema import get_connection  # noqa: E402
 from patch_apply import apply_unified_diff, write_full_file  # noqa: E402
 
 PROMPTS_DIR = os.path.join(os.path.dirname(__file__), "..", "prompts")
-DEFAULT_MODEL = os.environ.get("DEV_AGENT_MODEL", "openai/gpt-oss-120b")
+DEFAULT_MODEL = os.environ.get(
+    "DEV_AGENT_MODEL",
+    "openai/gpt-oss-120b",
+)
+DEFAULT_PROVIDER = os.environ.get(
+    "DEV_AGENT_PROVIDER",
+    "groq",
+).lower()
 
 GROUND_TRUTH_MAX_FILES = 4
 REWRITE_SIMILARITY_FLOOR = 0.5
-
-# Preliminary caps -- these only bound how much of the budget KB
-# retrieval and ground-truth injection are ALLOWED to spend while being
-# built. The final output budget is computed afterward from actual
-# measured prompt cost, not from these percentages (see run()).
 PRELIM_OUTPUT_FRACTION = 0.35
 PRELIM_KB_FRACTION_OF_REMAINDER = 0.35
 MIN_OUTPUT_TOKENS = 2500
 MAX_OUTPUT_TOKENS_CAP = 8000
-PROMPT_SAFETY_MARGIN_TOKENS = 200  # buffer for estimate_tokens() slack
+PROMPT_SAFETY_MARGIN_TOKENS = 200
 
 _EXCLUDED_DIR_NAMES = {
     ".git",
@@ -93,14 +69,15 @@ _EXCLUDED_DIR_NAMES = {
 }
 
 
-def _compute_preliminary_budgets(allocated_budget_tokens: int) -> Tuple[int, int, int]:
-    """Bounds for KB context and ground truth ONLY -- not the final
-    output budget, which is computed later from real prompt cost. Keeps
-    either retrieval step from unilaterally consuming the whole ceiling
-    while it's being assembled."""
+def _compute_preliminary_budgets(
+    allocated_budget_tokens: int,
+) -> Tuple[int, int, int]:
     prelim_output = max(
         MIN_OUTPUT_TOKENS,
-        min(MAX_OUTPUT_TOKENS_CAP, int(allocated_budget_tokens * PRELIM_OUTPUT_FRACTION)),
+        min(
+            MAX_OUTPUT_TOKENS_CAP,
+            int(allocated_budget_tokens * PRELIM_OUTPUT_FRACTION),
+        ),
     )
     remainder = max(allocated_budget_tokens - prelim_output, 400)
     kb_budget = int(remainder * PRELIM_KB_FRACTION_OF_REMAINDER)
@@ -168,7 +145,10 @@ def _build_ground_truth_block(
     target_files: List[str],
     budget_tokens: int,
 ) -> Tuple[str, Set[str]]:
-    max_total_chars = max(int(budget_tokens * CHARS_PER_TOKEN_ESTIMATE), 500)
+    max_total_chars = max(
+        int(budget_tokens * CHARS_PER_TOKEN_ESTIMATE),
+        500,
+    )
     blocks: List[str] = []
     verified: Set[str] = set()
     used_chars = 0
@@ -178,12 +158,19 @@ def _build_ground_truth_block(
         if remaining_chars <= 200:
             break
 
-        content = _read_existing_file(repo_root, rel_path, max_chars=remaining_chars)
+        content = _read_existing_file(
+            repo_root,
+            rel_path,
+            max_chars=remaining_chars,
+        )
         if content is None:
             continue
 
         verified.add(rel_path)
-        block = f"### EXACT CURRENT CONTENT of {rel_path}\n```python\n{content}\n```"
+        block = (
+            f"### EXACT CURRENT CONTENT of {rel_path}\n"
+            f"```python\n{content}\n```"
+        )
         blocks.append(block)
         used_chars += len(block)
 
@@ -250,7 +237,10 @@ def _validate_edit_contract(result: Any) -> Tuple[bool, str]:
         if not isinstance(result[field], str):
             return False, f"{field} must be a string"
 
-    for field, item_key in (("new_files", "content"), ("diffs", "diff")):
+    for field, item_key in (
+        ("new_files", "content"),
+        ("diffs", "diff"),
+    ):
         value = result[field]
         if not isinstance(value, list):
             return False, f"{field} must be an array"
@@ -260,18 +250,31 @@ def _validate_edit_contract(result: Any) -> Tuple[bool, str]:
             if not isinstance(entry, dict):
                 return False, f"{field} entries must be objects"
             if set(entry.keys()) != {"path", item_key}:
-                return False, f"{field} entries must have exactly 'path' and '{item_key}'"
-            if not isinstance(entry["path"], str) or not isinstance(entry[item_key], str):
-                return False, f"{field} entries must have string 'path' and '{item_key}'"
+                return False, (
+                    f"{field} entries must have exactly 'path' and "
+                    f"'{item_key}'"
+                )
+            if not isinstance(entry["path"], str):
+                return False, f"{field} path must be a string"
+            if not isinstance(entry[item_key], str):
+                return False, f"{field} {item_key} must be a string"
             if entry["path"] in seen_paths:
-                return False, f"{field} contains duplicate path: {entry['path']}"
+                return False, (
+                    f"{field} contains duplicate path: "
+                    f"{entry['path']}"
+                )
             seen_paths.add(entry["path"])
 
-    new_file_paths = {entry["path"] for entry in result["new_files"]}
+    new_file_paths = {
+        entry["path"] for entry in result["new_files"]
+    }
     diff_paths = {entry["path"] for entry in result["diffs"]}
     overlap = new_file_paths & diff_paths
     if overlap:
-        return False, f"paths appear in both new_files and diffs: {sorted(overlap)}"
+        return False, (
+            f"paths appear in both new_files and diffs: "
+            f"{sorted(overlap)}"
+        )
 
     if result["blocked"]:
         if result["new_files"] or result["diffs"]:
@@ -282,7 +285,9 @@ def _validate_edit_contract(result: Any) -> Tuple[bool, str]:
     return True, ""
 
 
-def _edits_to_dicts(result: Dict[str, Any]) -> Tuple[Dict[str, str], Dict[str, str]]:
+def _edits_to_dicts(
+    result: Dict[str, Any],
+) -> Tuple[Dict[str, str], Dict[str, str]]:
     new_files = {
         entry["path"].replace("\\", "/"): entry["content"]
         for entry in result["new_files"]
@@ -292,6 +297,37 @@ def _edits_to_dicts(result: Dict[str, Any]) -> Tuple[Dict[str, str], Dict[str, s
         for entry in result["diffs"]
     }
     return new_files, diffs
+
+
+def _call_provider(
+    provider: str,
+    model: str,
+    system_prompt: str,
+    user_prompt: str,
+    max_output_tokens: int,
+    allocated_budget_tokens: int,
+) -> Dict[str, Any]:
+    if provider == "cerebras":
+        return call_cerebras_json(
+            model=os.getenv(
+                "CEREBRAS_MODEL",
+                model,
+            ),
+            system_prompt=system_prompt,
+            user_prompt=user_prompt,
+            max_output_tokens=max_output_tokens,
+        )
+
+    key_pool = GroqKeyPool()
+    return call_groq_json(
+        key_pool=key_pool,
+        model=model,
+        system_prompt=system_prompt,
+        user_prompt=user_prompt,
+        max_output_tokens=max_output_tokens,
+        token_ceiling=allocated_budget_tokens,
+        response_schema=DEV_AGENT_RESPONSE_SCHEMA,
+    )
 
 
 def run(
@@ -305,8 +341,8 @@ def run(
     start_time = time.time()
     system_prompt = load_prompt(PROMPTS_DIR, "dev_agent_prompt.md")
 
-    prelim_output, prelim_kb_budget, prelim_ground_truth_budget = _compute_preliminary_budgets(
-        allocated_budget_tokens
+    _, prelim_kb_budget, prelim_ground_truth_budget = (
+        _compute_preliminary_budgets(allocated_budget_tokens)
     )
 
     if os.path.exists(db_path):
@@ -323,10 +359,12 @@ def run(
         kb_context = "(knowledge base not yet built)"
 
     target_files = _guess_target_files(task_text, repo_root)
-    ground_truth_block, verified_ground_truth_files = _build_ground_truth_block(
-        repo_root,
-        target_files,
-        budget_tokens=prelim_ground_truth_budget,
+    ground_truth_block, verified_ground_truth_files = (
+        _build_ground_truth_block(
+            repo_root,
+            target_files,
+            budget_tokens=prelim_ground_truth_budget,
+        )
     )
 
     user_prompt = (
@@ -337,61 +375,78 @@ def run(
         "## Exact current file content -- authoritative ground truth\n"
         "Make only the requested change. Preserve all unrelated content. "
         "If the required existing file is not shown, set blocked=true. "
-        "For a small file or a change touching most of the file, return the "
-        "complete updated content as a new_files entry. For a larger file "
-        "with a small, localized change, return a unified diff against the "
-        "exact content shown below instead -- this is preferred for large "
-        "files because it costs far fewer output tokens than reproducing "
-        "the whole file.\n\n"
+        "For a small file or a change touching most of the file, return "
+        "complete updated content. For a larger file with a localized "
+        "change, return a unified diff against the exact content shown.\n\n"
         f"{ground_truth_block}\n\n"
         "## Non-negotiable output contract\n"
-        "Return exactly one JSON object and nothing else. The object must "
-        "contain exactly these fields: blocked, blocked_reason, summary, "
-        "jira_key, new_files, diffs. new_files and diffs are JSON ARRAYS; "
-        "each element is an object with exactly two string fields -- "
-        "{\"path\": ..., \"content\": ...} for new_files, "
-        "{\"path\": ..., \"diff\": ...} for diffs. Never repeat the same "
-        "path twice within one array, and never put the same path in both "
-        "arrays. Never return arrays of lines, nested objects, null, "
-        "numbers, Markdown, or prose. If blocked is true, both arrays must "
-        "be empty."
+        "Return exactly one JSON object and nothing else. It must contain "
+        "blocked, blocked_reason, summary, jira_key, new_files, diffs. "
+        "new_files and diffs are arrays. Each new_files item has exactly "
+        "path and content string fields. Each diffs item has exactly path "
+        "and diff string fields. Never return arrays of source lines, "
+        "nested objects, null, numbers, Markdown, or prose. Do not repeat "
+        "a path. A blocked response must have both arrays empty."
+    )
+
+    prompt_tokens_actual = (
+        estimate_tokens(system_prompt)
+        + estimate_tokens(user_prompt)
     )
 
     if max_output_tokens is None:
-        # Reclaim: base the ACTUAL output budget on what the assembled
-        # prompt really costs, not the preliminary percentage split --
-        # unused KB/ground-truth budget (very common when KB retrieval
-        # matches nothing) goes to the generation that actually needs it.
-        prompt_tokens_actual = estimate_tokens(system_prompt) + estimate_tokens(user_prompt)
-        reclaimed_output = allocated_budget_tokens - prompt_tokens_actual - PROMPT_SAFETY_MARGIN_TOKENS
+        reclaimed_output = (
+            allocated_budget_tokens
+            - prompt_tokens_actual
+            - PROMPT_SAFETY_MARGIN_TOKENS
+        )
 
         if reclaimed_output < MIN_OUTPUT_TOKENS:
             return {
                 "status": "BLOCKED",
                 "blocked_reason": (
-                    f"Allocated budget ({allocated_budget_tokens} tokens) leaves only "
-                    f"~{max(reclaimed_output, 0)} tokens for the response after the prompt "
-                    f"(~{prompt_tokens_actual} tokens, mostly ground-truth file content). "
-                    f"That's not enough to reliably complete a schema-valid edit -- rather than "
-                    f"spend an API call on a truncation failure, blocking early. Increase the "
-                    f"DCBA budget for this task, or scope the task to a smaller/more localized "
-                    f"change so less ground truth is required."
+                    f"Allocated budget ({allocated_budget_tokens}) leaves "
+                    f"only approximately {max(reclaimed_output, 0)} output "
+                    f"tokens after the estimated prompt ({prompt_tokens_actual})."
                 ),
                 "usage": {},
                 "latency_ms": (time.time() - start_time) * 1000,
             }
 
-        max_output_tokens = max(MIN_OUTPUT_TOKENS, min(MAX_OUTPUT_TOKENS_CAP, reclaimed_output))
+        max_output_tokens = min(
+            MAX_OUTPUT_TOKENS_CAP,
+            reclaimed_output,
+        )
 
-    key_pool = GroqKeyPool()
-    result = call_groq_json(
-        key_pool=key_pool,
+    provider = os.getenv(
+        "DEV_AGENT_PROVIDER",
+        DEFAULT_PROVIDER,
+    ).lower()
+
+    print(
+        "[DEV_AGENT_TOKEN_DEBUG] "
+        + json.dumps(
+            {
+                "provider": provider,
+                "model": model,
+                "allocated_budget_tokens": allocated_budget_tokens,
+                "system_prompt_tokens": estimate_tokens(system_prompt),
+                "user_prompt_tokens": estimate_tokens(user_prompt),
+                "prompt_tokens": prompt_tokens_actual,
+                "max_output_tokens": max_output_tokens,
+            },
+            sort_keys=True,
+        ),
+        flush=True,
+    )
+
+    result = _call_provider(
+        provider=provider,
         model=model,
         system_prompt=system_prompt,
         user_prompt=user_prompt,
         max_output_tokens=max_output_tokens,
-        token_ceiling=allocated_budget_tokens,
-        response_schema=DEV_AGENT_RESPONSE_SCHEMA,
+        allocated_budget_tokens=allocated_budget_tokens,
     )
 
     usage = result.pop("_usage", {})
@@ -430,15 +485,17 @@ def run(
             )
             continue
 
-        existing_content = _read_existing_file(repo_root, rel_path)
+        existing_content = _read_existing_file(
+            repo_root,
+            rel_path,
+        )
 
         if (
             existing_content is not None
             and rel_path not in verified_ground_truth_files
         ):
             apply_errors.append(
-                f"{rel_path}: refusing overwrite because exact ground truth "
-                "was not supplied to the model"
+                f"{rel_path}: exact ground truth was not supplied"
             )
             continue
 
@@ -447,7 +504,7 @@ def run(
             content,
         ):
             apply_errors.append(
-                f"{rel_path}: rewrite is too dissimilar to the existing file"
+                f"{rel_path}: rewrite is too dissimilar to existing file"
             )
             continue
 
@@ -464,24 +521,18 @@ def run(
             )
             continue
 
-        # NOTE: diffs against ground-truth files are now ALLOWED (see
-        # module docstring) -- ground truth being present is exactly what
-        # makes a diff trustworthy, not a reason to forbid one. A file
-        # that exists on disk but was never shown as ground truth is
-        # still refused below, since the diff's context lines can't be
-        # trusted to match content the model never saw.
         existing_content = _read_existing_file(repo_root, rel_path)
-        if existing_content is not None and rel_path not in verified_ground_truth_files:
+        if (
+            existing_content is not None
+            and rel_path not in verified_ground_truth_files
+        ):
             apply_errors.append(
-                f"{rel_path}: refusing to apply diff -- this file's exact content "
-                "was never shown to the model as ground truth"
+                f"{rel_path}: exact ground truth was not supplied"
             )
             continue
 
         if not _diff_is_meaningful(diff_text):
-            apply_errors.append(
-                f"{rel_path}: diff is empty or a no-op"
-            )
+            apply_errors.append(f"{rel_path}: diff is empty or a no-op")
             continue
 
         success, message = apply_unified_diff(repo_root, diff_text)
