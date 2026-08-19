@@ -55,14 +55,16 @@ jobs:
       # never has to parse through the task text's actual content at all.
       - name: Run orchestrator (Dev Agent -> PR -> Code Review Agent)
         env:
-          CEREBRAS_API_KEY: ${{ secrets.CEREBRAS_API_KEY }} 
+          CEREBRAS_API_KEY: ${{ secrets.CEREBRAS_API_KEY }}
+          DEV_AGENT_PROVIDER: cerebras
+          DEV_AGENT_MODEL: gpt-oss-120b
+          CEREBRAS_MODEL: gpt-oss-120b
           GROQ_API_KEY_1: ${{ secrets.GROQ_API_KEY_1 }}
           GROQ_API_KEY_2: ${{ secrets.GROQ_API_KEY_2 }}
           GROQ_API_KEY_3: ${{ secrets.GROQ_API_KEY_3 }}
           GROQ_API_KEY_4: ${{ secrets.GROQ_API_KEY_4 }}
           GROQ_API_KEY_5: ${{ secrets.GROQ_API_KEY_5 }}
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          DEV_AGENT_MODEL: qwen/qwen3.6-27b
           TASK_TEXT: ${{ inputs.task_text }}
           REPO_FULL_NAME: ${{ github.repository }}
         run: |

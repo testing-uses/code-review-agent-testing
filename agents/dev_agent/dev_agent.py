@@ -38,14 +38,15 @@ from kb_schema import get_connection  # noqa: E402
 from patch_apply import apply_unified_diff, write_full_file  # noqa: E402
 
 PROMPTS_DIR = os.path.join(os.path.dirname(__file__), "..", "prompts")
-DEFAULT_MODEL = os.environ.get(
-    "DEV_AGENT_MODEL",
-    "openai/gpt-oss-120b",
-)
 DEFAULT_PROVIDER = os.environ.get(
     "DEV_AGENT_PROVIDER",
-    "groq",
+    "cerebras",
 ).lower()
+
+DEFAULT_MODEL = os.environ.get(
+    "DEV_AGENT_MODEL",
+    "gpt-oss-120b",
+)
 
 GROUND_TRUTH_MAX_FILES = 4
 REWRITE_SIMILARITY_FLOOR = 0.5
@@ -311,6 +312,7 @@ def _call_provider(
         return call_cerebras_json(
             model=os.getenv(
                 "CEREBRAS_MODEL",
+                "gpt-oss-120b",
                 model,
             ),
             system_prompt=system_prompt,
