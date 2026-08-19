@@ -1,12 +1,66 @@
+"""
+frontend/app.py
+
+Flask backend for the Agentic AI Pipeline frontend. The browser never sees
+a GitHub token -- this server holds it and calls the GitHub REST API to
+dispatch workflows and pull back live progress.
+
+CHANGE (balanced against the React rewrite in frontend/react/src/App.jsx):
+
+1. Fixed the recurring route bug: /status/ was missing <int:run_id>,
+   which meant fetch(`/status/${runId}`) from App.jsx would 404 every
+   time. This is the same bug that broke the old Jinja-template frontend
+   too -- fixing it here for good.
+
+2. App.jsx is a separate Vite/React app, not a Jinja template. This file
+   now supports BOTH ways of running it:
+
+   a) DEV MODE (recommended while developing App.jsx): run Flask on
+      :5000 and Vite's dev server separately on :5173. Flask-CORS is
+      enabled so the Vite dev server can call this API cross-origin.
+      Configure Vite's dev proxy (vite.config.js) to forward /trigger,
+      /runs, /status/* to http://127.0.0.1:5000 if you want same-origin
+      relative fetch() calls to just work without CORS at all -- either
+      approach is fine, CORS is enabled here so it works even without
+      the proxy.
+
+   b) PRODUCTION / SINGLE-SERVER MODE: run `npm run build` in the React
+      app, which outputs static files to frontend/react/dist. Flask then
+      serves those files directly and App.jsx's relative fetch('/trigger'),
+      fetch('/runs'), fetch('/status/...') calls hit this same Flask
+      process with no CORS needed at all, because everything is
+      same-origin.
+
+   The JSON shapes returned by /runs and /status/<run_id> are UNCHANGED
+   from the previous version -- App.jsx was written against this exact
+   contract (run.html_url, jobs[].id/name/status/conclusion,
+   events[], logs[].job_id/job_name/lines), so no field renaming needed.
+
+Run (dev mode, with Vite running separately on :5173):
+    export GITHUB_DISPATCH_TOKEN=ghp_xxx
+    python frontend/app.py
+    # in another terminal: cd frontend/react && npm run dev
+
+Run (production mode, single server):
+    cd frontend/react && npm run build
+    export GITHUB_DISPATCH_TOKEN=ghp_xxx
+    python frontend/app.py
+    # open http://127.0.0.1:5000 -- Flask serves the built React app directly
+"""
+
 import json
 import os
 import zipfile
 from io import BytesIO
 
 import requests
-from flask import Flask, jsonify, render_template, request
+from flask import Flask, jsonify, request, send_from_directory
 
-app = Flask(__name__)
+try:
+    from flask_cors import CORS
+    _CORS_AVAILABLE = True
+except ImportError:
+    _CORS_AVAILABLE = False
 
 REPO_FULL_NAME = os.environ.get(
     "REPO_FULL_NAME",
@@ -19,6 +73,32 @@ WORKFLOW_FILE = os.environ.get(
 GITHUB_API_BASE = "https://api.github.com"
 PIPELINE_PREFIX = "[PIPELINE] "
 
+# Where the built React app lives after `npm run build` inside
+# frontend/react. If this directory doesn't exist yet (you haven't built
+# the React app, or you're only running Vite's dev server separately),
+# Flask simply won't have anything to serve at "/" -- that's fine in dev
+# mode, since Vite serves the UI on its own port instead.
+REACT_BUILD_DIR = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)),
+    "react",
+    "dist",
+)
+
+app = Flask(__name__, static_folder=None)
+
+# Only needed for DEV MODE (Vite on a different port calling this API
+# cross-origin). Harmless to leave enabled in production mode too, since
+# same-origin requests aren't affected by CORS headers either way.
+if _CORS_AVAILABLE:
+    CORS(
+        app,
+        resources={
+            r"/trigger": {"origins": "*"},
+            r"/runs": {"origins": "*"},
+            r"/status/*": {"origins": "*"},
+        },
+    )
+
 
 def github_headers():
     token = os.environ.get("GITHUB_DISPATCH_TOKEN")
@@ -26,7 +106,7 @@ def github_headers():
     if not token:
         raise RuntimeError(
             "GITHUB_DISPATCH_TOKEN is not configured. "
-            "Set it in PowerShell before starting Flask."
+            "Set it in the same terminal before starting Flask."
         )
 
     return {
@@ -50,10 +130,41 @@ def handle_runtime_error(error):
     return jsonify({"error": str(error)}), 500
 
 
-@app.route("/")
-def index():
-    return render_template("index.html")
+@app.errorhandler(Exception)
+def handle_unexpected_error(error):
+    app.logger.exception("Unhandled Flask error")
+    return jsonify({
+        "error": str(error),
+        "type": type(error).__name__,
+    }), 500
 
+
+# ---- Serve the built React app (production mode) ----
+# In dev mode (React app running via `npm run dev` on its own port), this
+# route simply won't be hit for the UI -- you'd open Vite's dev server
+# URL instead, and only the API routes below matter.
+@app.route("/", defaults={"path": ""})
+@app.route("/<path:path>")
+def serve_react_app(path):
+    if not os.path.isdir(REACT_BUILD_DIR):
+        return jsonify({
+            "error": (
+                "React build not found at frontend/react/dist. "
+                "Run `npm run build` inside frontend/react for production "
+                "mode, or run the Vite dev server separately (npm run dev) "
+                "and use its URL instead of this Flask server's root."
+            ),
+        }), 404
+
+    requested_path = os.path.join(REACT_BUILD_DIR, path)
+    if path and os.path.isfile(requested_path):
+        return send_from_directory(REACT_BUILD_DIR, path)
+
+    # SPA fallback -- any non-file path (client-side route) gets index.html
+    return send_from_directory(REACT_BUILD_DIR, "index.html")
+
+
+# ---- API routes used by App.jsx ----
 
 @app.route("/trigger", methods=["POST"])
 def trigger():
@@ -200,6 +311,8 @@ def deduplicate_events(events):
     return unique
 
 
+# FIX: this was previously "/status/" with no <int:run_id> -- App.jsx's
+# fetch(`/status/${runId}`) would 404 against that route every time.
 @app.route("/status/<int:run_id>")
 def status(run_id):
     run_response = github_get(
