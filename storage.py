@@ -8,7 +8,7 @@ from typing import Dict, List, Optional
 
 from models import Book, Loan, Member
 
-LOAN_PERIOD_DAYS = 14
+LOAN_PERIOD_DAYS = 15
 
 
 class LibraryStore:
