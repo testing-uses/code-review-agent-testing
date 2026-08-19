@@ -150,7 +150,7 @@ export default function App() {
       <header className="app-header">
         <h1>Agentic AI <span>Pipeline</span></h1>
         <p>
-          Submit a task — Dev Agent, Orchestrator, and Code Review Agent run inside
+          Submit a task - Dev Agent, Orchestrator, and Code Review Agent run inside
           GitHub Actions and stream live updates below.
         </p>
       </header>
@@ -177,7 +177,7 @@ export default function App() {
           >
             {submitting
               ? <><span className="spinner" style={{ width: 13, height: 13, borderWidth: 2 }} />Dispatching…</>
-              : '⚡ Submit Task'
+              : ' Submit Task'
             }
           </button>
           <kbd style={{ fontSize: 11, color: 'var(--text-muted)', userSelect: 'none' }}>⌘ Enter</kbd>
