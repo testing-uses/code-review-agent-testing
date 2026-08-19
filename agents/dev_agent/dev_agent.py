@@ -40,7 +40,7 @@ from kb_schema import get_connection  # noqa: E402
 from patch_apply import apply_unified_diff, write_full_file  # noqa: E402
 
 PROMPTS_DIR = os.path.join(os.path.dirname(__file__), "..", "prompts")
-DEFAULT_MODEL = "llama-3.3-70b-versatile"
+DEFAULT_MODEL = "openai/gpt-oss-120b"
 
 GROUND_TRUTH_MAX_CHARS_PER_FILE = 6000
 GROUND_TRUTH_MAX_FILES = 4
