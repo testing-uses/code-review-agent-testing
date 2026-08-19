@@ -42,6 +42,17 @@ jobs:
           git config user.name "dev-agent-bot"
           git config user.email "dev-agent-bot@users.noreply.github.com"
 
+      # CHANGE: task_text is now passed through env, not interpolated
+      # directly into the shell command. ${{ inputs.task_text }} used to
+      # be substituted literally into a quoted, backslash-continued bash
+      # argument -- if the task text itself contained a trailing "\", an
+      # unescaped '"', or a real newline, it could break the continuation
+      # chain mid-command. Bash would then silently treat everything
+      # after the break (including --repo-full-name and --base-branch)
+      # as a separate command, which is exactly what caused:
+      #   error: the following arguments are required: --repo-full-name
+      # Referencing $TASK_TEXT as a shell variable instead means bash
+      # never has to parse through the task text's actual content at all.
       - name: Run orchestrator (Dev Agent -> PR -> Code Review Agent)
         env:
           GROQ_API_KEY_1: ${{ secrets.GROQ_API_KEY_1 }}
@@ -50,13 +61,15 @@ jobs:
           GROQ_API_KEY_4: ${{ secrets.GROQ_API_KEY_4 }}
           GROQ_API_KEY_5: ${{ secrets.GROQ_API_KEY_5 }}
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TASK_TEXT: ${{ inputs.task_text }}
+          REPO_FULL_NAME: ${{ github.repository }}
         run: |
           python agents/orchestrator/master_agent.py \
-            --task-text "${{ inputs.task_text }}" \
             --repo-root . \
             --db-path agents/knowledge_base/kb.sqlite3 \
-            --repo-full-name "${{ github.repository }}" \
-            --base-branch main
+            --repo-full-name "$REPO_FULL_NAME" \
+            --base-branch main \
+            --task-text "$TASK_TEXT"
 
       - name: Upload metrics artifact
         if: always()
