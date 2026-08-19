@@ -1,29 +1,38 @@
-"""agents/dev_agent/dev_agent.py  (v6)
+"""agents/dev_agent/dev_agent.py  (v7)
 
-CHANGES from v5 (the "strict" version):
-  - Adapted to the new array-based new_files/diffs wire format (see
-    groq_client.DEV_AGENT_RESPONSE_SCHEMA for why) -- _validate_edit_contract
-    now checks arrays of {path, content|diff} objects, and a new
-    _edits_to_dicts() converts them back into the plain {path: content}
-    dicts the apply logic already worked with, so nothing below that
-    point had to change.
-  - max_output_tokens is no longer a hardcoded 1500. Ground-truth file
-    injection was never counted against the DCBA-allocated budget at
-    all (up to ~7,200+ tokens uncapped, competing with a fixed 1500
-    output limit for the same ceiling) -- under strict-schema constrained
-    decoding, running out of room mid-generation doesn't degrade to
-    truncated-but-parseable JSON, it just fails outright with an empty
-    failed_generation. _compute_dynamic_budgets() now splits the actual
-    DCBA ceiling three ways (output / KB context / ground truth) so the
-    budget DCBA computed is the budget that's actually enforced, not
-    decorative.
-  - _build_ground_truth_block() now takes a real token budget and
-    truncates the AGGREGATE ground-truth text to fit it, instead of a
-    flat 6000-chars-per-file cap with no total limit.
+CHANGES from v6 (both found from a real truncation failure, not
+hypothetical):
 
-Everything else (ground-truth enforcement at apply time, no-op diff
-rejection, rewrite-similarity guard, protected-path checks) is unchanged
-from v5 and still applies to the converted dict form.
+  1. REMOVED: "diffs are forbidden for exact ground-truth files". That
+     rule made every edit to a ground-truth file go through a full-file
+     rewrite, no matter the file's size -- paying token cost to show the
+     model the whole file (input) AND have it reproduce almost the whole
+     file back (output). For a large file and a one-line change, that's
+     nearly 2x the file's real token cost for nothing. The rule existed
+     to stop diffing against content the model never actually saw --
+     that risk doesn't apply once ground truth WAS shown, which is
+     exactly the case this blocked. Diffs against ground-truth files are
+     now allowed; the existing safety nets (no-op-diff rejection,
+     rewrite-similarity floor for full-file rewrites) still apply
+     regardless of which path is used.
+
+  2. max_output_tokens is no longer sized from a preliminary percentage
+     split before the prompt exists. select_context()/ground-truth are
+     still bounded by a preliminary split (so neither can unilaterally
+     eat the whole budget), but the FINAL output budget is now computed
+     from what the assembled prompt actually costs (measured with
+     estimate_tokens, not guessed) -- so budget that KB retrieval didn't
+     use (e.g. "matched_context_entries": 0, a common case) gets
+     reclaimed for the generation that actually needs it, instead of
+     being wasted while the model gets truncated mid-file.
+
+  3. If, even after reclaiming, there isn't enough budget left for a
+     viable generation, this now fails FAST with a clear blocked_reason
+     before ever calling Groq -- instead of spending an API call to
+     rediscover the same truncation failure the math already predicted.
+
+  4. DEFAULT_MODEL is now overridable via the DEV_AGENT_MODEL env var,
+     so a different Groq model can be tried without a code change.
 """
 
 from __future__ import annotations
@@ -48,22 +57,27 @@ from groq_client import (  # noqa: E402
     DEV_AGENT_RESPONSE_SCHEMA,
     GroqKeyPool,
     call_groq_json,
+    estimate_tokens,
     load_prompt,
 )
 from kb_schema import get_connection  # noqa: E402
 from patch_apply import apply_unified_diff, write_full_file  # noqa: E402
 
 PROMPTS_DIR = os.path.join(os.path.dirname(__file__), "..", "prompts")
-DEFAULT_MODEL = "openai/gpt-oss-120b"
+DEFAULT_MODEL = os.environ.get("DEV_AGENT_MODEL", "openai/gpt-oss-120b")
 
 GROUND_TRUTH_MAX_FILES = 4
 REWRITE_SIMILARITY_FLOOR = 0.5
 
-# Dynamic budget split (see _compute_dynamic_budgets docstring).
+# Preliminary caps -- these only bound how much of the budget KB
+# retrieval and ground-truth injection are ALLOWED to spend while being
+# built. The final output budget is computed afterward from actual
+# measured prompt cost, not from these percentages (see run()).
+PRELIM_OUTPUT_FRACTION = 0.35
+PRELIM_KB_FRACTION_OF_REMAINDER = 0.35
 MIN_OUTPUT_TOKENS = 900
-MAX_OUTPUT_TOKENS_CAP = 4000
-OUTPUT_BUDGET_FRACTION = 0.35
-KB_CONTEXT_FRACTION_OF_REMAINDER = 0.35
+MAX_OUTPUT_TOKENS_CAP = 8000
+PROMPT_SAFETY_MARGIN_TOKENS = 150  # buffer for estimate_tokens() slack
 
 _EXCLUDED_DIR_NAMES = {
     ".git",
@@ -79,24 +93,19 @@ _EXCLUDED_DIR_NAMES = {
 }
 
 
-def _compute_dynamic_budgets(allocated_budget_tokens: int) -> Tuple[int, int, int]:
-    """Split the DCBA-allocated ceiling three ways instead of the old
-    fixed 0.6-for-KB-context / hardcoded-1500-for-output split that let
-    ground truth injection silently eat the whole budget.
-
-    Returns (output_budget_tokens, kb_context_budget_tokens, ground_truth_budget_tokens).
-    All three plus the system+user prompt overhead stay within
-    allocated_budget_tokens by construction, so preflight_check should
-    never reject a request assembled from these numbers under normal
-    conditions."""
-    output_budget = max(
+def _compute_preliminary_budgets(allocated_budget_tokens: int) -> Tuple[int, int, int]:
+    """Bounds for KB context and ground truth ONLY -- not the final
+    output budget, which is computed later from real prompt cost. Keeps
+    either retrieval step from unilaterally consuming the whole ceiling
+    while it's being assembled."""
+    prelim_output = max(
         MIN_OUTPUT_TOKENS,
-        min(MAX_OUTPUT_TOKENS_CAP, int(allocated_budget_tokens * OUTPUT_BUDGET_FRACTION)),
+        min(MAX_OUTPUT_TOKENS_CAP, int(allocated_budget_tokens * PRELIM_OUTPUT_FRACTION)),
     )
-    remainder = max(allocated_budget_tokens - output_budget, 400)
-    kb_budget = int(remainder * KB_CONTEXT_FRACTION_OF_REMAINDER)
+    remainder = max(allocated_budget_tokens - prelim_output, 400)
+    kb_budget = int(remainder * PRELIM_KB_FRACTION_OF_REMAINDER)
     ground_truth_budget = remainder - kb_budget
-    return output_budget, kb_budget, ground_truth_budget
+    return prelim_output, kb_budget, ground_truth_budget
 
 
 def _read_existing_file(
@@ -159,10 +168,6 @@ def _build_ground_truth_block(
     target_files: List[str],
     budget_tokens: int,
 ) -> Tuple[str, Set[str]]:
-    """Truncates the AGGREGATE ground-truth block to fit budget_tokens
-    (not a flat per-file cap) -- so a task naming several files degrades
-    gracefully (later/larger files get less room, or get dropped) instead
-    of silently producing a prompt that blows past the DCBA ceiling."""
     max_total_chars = max(int(budget_tokens * CHARS_PER_TOKEN_ESTIMATE), 500)
     blocks: List[str] = []
     verified: Set[str] = set()
@@ -171,7 +176,7 @@ def _build_ground_truth_block(
     for rel_path in target_files:
         remaining_chars = max_total_chars - used_chars
         if remaining_chars <= 200:
-            break  # not enough budget left for another file to be useful
+            break
 
         content = _read_existing_file(repo_root, rel_path, max_chars=remaining_chars)
         if content is None:
@@ -223,10 +228,6 @@ def _diff_is_meaningful(diff_text: str) -> bool:
 
 
 def _validate_edit_contract(result: Any) -> Tuple[bool, str]:
-    """Validates the array-based wire format: new_files/diffs are arrays
-    of {path, content} / {path, diff} objects (see groq_client's schema
-    docstring for why -- strict mode can't express a dict keyed by
-    arbitrary file paths)."""
     if not isinstance(result, dict):
         return False, "response must be a JSON object"
 
@@ -282,9 +283,6 @@ def _validate_edit_contract(result: Any) -> Tuple[bool, str]:
 
 
 def _edits_to_dicts(result: Dict[str, Any]) -> Tuple[Dict[str, str], Dict[str, str]]:
-    """Converts the wire format (arrays of {path, content|diff}) into the
-    {path: content} dicts the apply logic below expects -- keeps that
-    logic identical to before the schema had to switch to arrays."""
     new_files = {
         entry["path"].replace("\\", "/"): entry["content"]
         for entry in result["new_files"]
@@ -307,11 +305,9 @@ def run(
     start_time = time.time()
     system_prompt = load_prompt(PROMPTS_DIR, "dev_agent_prompt.md")
 
-    computed_output_budget, context_budget, ground_truth_budget = _compute_dynamic_budgets(
+    prelim_output, prelim_kb_budget, prelim_ground_truth_budget = _compute_preliminary_budgets(
         allocated_budget_tokens
     )
-    if max_output_tokens is None:
-        max_output_tokens = computed_output_budget
 
     if os.path.exists(db_path):
         connection = get_connection(db_path)
@@ -319,7 +315,7 @@ def run(
             kb_context = select_context(
                 connection,
                 task_text,
-                budget_tokens=context_budget,
+                budget_tokens=prelim_kb_budget,
             )
         finally:
             connection.close()
@@ -330,7 +326,7 @@ def run(
     ground_truth_block, verified_ground_truth_files = _build_ground_truth_block(
         repo_root,
         target_files,
-        budget_tokens=ground_truth_budget,
+        budget_tokens=prelim_ground_truth_budget,
     )
 
     user_prompt = (
@@ -340,7 +336,13 @@ def run(
         f"{kb_context}\n\n"
         "## Exact current file content -- authoritative ground truth\n"
         "Make only the requested change. Preserve all unrelated content. "
-        "If the required existing file is not shown, set blocked=true.\n\n"
+        "If the required existing file is not shown, set blocked=true. "
+        "For a small file or a change touching most of the file, return the "
+        "complete updated content as a new_files entry. For a larger file "
+        "with a small, localized change, return a unified diff against the "
+        "exact content shown below instead -- this is preferred for large "
+        "files because it costs far fewer output tokens than reproducing "
+        "the whole file.\n\n"
         f"{ground_truth_block}\n\n"
         "## Non-negotiable output contract\n"
         "Return exactly one JSON object and nothing else. The object must "
@@ -351,10 +353,35 @@ def run(
         "{\"path\": ..., \"diff\": ...} for diffs. Never repeat the same "
         "path twice within one array, and never put the same path in both "
         "arrays. Never return arrays of lines, nested objects, null, "
-        "numbers, Markdown, or prose. For an existing ground-truth file, "
-        "return the complete updated file as one string in a new_files "
-        "entry. If blocked is true, both arrays must be empty."
+        "numbers, Markdown, or prose. If blocked is true, both arrays must "
+        "be empty."
     )
+
+    if max_output_tokens is None:
+        # Reclaim: base the ACTUAL output budget on what the assembled
+        # prompt really costs, not the preliminary percentage split --
+        # unused KB/ground-truth budget (very common when KB retrieval
+        # matches nothing) goes to the generation that actually needs it.
+        prompt_tokens_actual = estimate_tokens(system_prompt) + estimate_tokens(user_prompt)
+        reclaimed_output = allocated_budget_tokens - prompt_tokens_actual - PROMPT_SAFETY_MARGIN_TOKENS
+
+        if reclaimed_output < MIN_OUTPUT_TOKENS:
+            return {
+                "status": "BLOCKED",
+                "blocked_reason": (
+                    f"Allocated budget ({allocated_budget_tokens} tokens) leaves only "
+                    f"~{max(reclaimed_output, 0)} tokens for the response after the prompt "
+                    f"(~{prompt_tokens_actual} tokens, mostly ground-truth file content). "
+                    f"That's not enough to reliably complete a schema-valid edit -- rather than "
+                    f"spend an API call on a truncation failure, blocking early. Increase the "
+                    f"DCBA budget for this task, or scope the task to a smaller/more localized "
+                    f"change so less ground truth is required."
+                ),
+                "usage": {},
+                "latency_ms": (time.time() - start_time) * 1000,
+            }
+
+        max_output_tokens = max(MIN_OUTPUT_TOKENS, min(MAX_OUTPUT_TOKENS_CAP, reclaimed_output))
 
     key_pool = GroqKeyPool()
     result = call_groq_json(
@@ -437,9 +464,17 @@ def run(
             )
             continue
 
-        if rel_path in verified_ground_truth_files:
+        # NOTE: diffs against ground-truth files are now ALLOWED (see
+        # module docstring) -- ground truth being present is exactly what
+        # makes a diff trustworthy, not a reason to forbid one. A file
+        # that exists on disk but was never shown as ground truth is
+        # still refused below, since the diff's context lines can't be
+        # trusted to match content the model never saw.
+        existing_content = _read_existing_file(repo_root, rel_path)
+        if existing_content is not None and rel_path not in verified_ground_truth_files:
             apply_errors.append(
-                f"{rel_path}: diffs are forbidden for exact ground-truth files"
+                f"{rel_path}: refusing to apply diff -- this file's exact content "
+                "was never shown to the model as ground truth"
             )
             continue
 

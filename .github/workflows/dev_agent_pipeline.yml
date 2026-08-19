@@ -61,6 +61,7 @@ jobs:
           GROQ_API_KEY_4: ${{ secrets.GROQ_API_KEY_4 }}
           GROQ_API_KEY_5: ${{ secrets.GROQ_API_KEY_5 }}
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          DEV_AGENT_MODEL: qwen/qwen3.6-27b
           TASK_TEXT: ${{ inputs.task_text }}
           REPO_FULL_NAME: ${{ github.repository }}
         run: |
