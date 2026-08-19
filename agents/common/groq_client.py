@@ -1,7 +1,23 @@
-"""agents/common/groq_client.py
+"""agents/common/groq_client.py  (v2)
 
-Shared Groq client with model-key rotation, prompt-size checks, retries,
-and optional strict JSON Schema output validation.
+CHANGES:
+  - DEV_AGENT_RESPONSE_SCHEMA restructured: diffs/new_files were
+    `{"type": "object", "additionalProperties": {"type": "string"}}` --
+    an arbitrary-key dictionary pattern. Groq's strict JSON Schema mode
+    requires additionalProperties to be exactly `false` on every object
+    with every property enumerated by name -- it structurally cannot
+    express "arbitrary file path -> string". That's not a prompt issue,
+    it's an invalid schema, and it fails identically on every attempt.
+    Fixed by switching to arrays of {"path": ..., "content"/"diff": ...}
+    objects, which strict mode supports natively (every object has a
+    fixed, fully-enumerated property set).
+  - Retry logic no longer retries HTTP 400/401. Those are deterministic
+    (invalid schema, malformed request, bad auth) -- retrying reproduces
+    the identical failure on every key and just burns attempts while
+    hiding the real error behind "All Groq attempts failed after N
+    attempts". Only 429/500/502/503/504 and connection errors are
+    retried now; 400/401 raise immediately with the real message (plus
+    a targeted hint for the two error shapes seen in practice).
 """
 
 from __future__ import annotations
@@ -27,6 +43,12 @@ load_dotenv(dotenv_path=ENV_FILE)
 
 CHARS_PER_TOKEN_ESTIMATE = 3.3
 
+# Strict JSON Schema mode (Groq/OpenAI-compatible) requires:
+#   - additionalProperties: false on every object, with no exceptions
+#   - every property enumerated by name -- no arbitrary/dynamic keys
+# A dict keyed by unknown file paths cannot be expressed this way, so
+# new_files/diffs are arrays of fixed-shape {path, content|diff} objects
+# instead of objects keyed by path.
 DEV_AGENT_RESPONSE_SCHEMA = {
     "type": "object",
     "additionalProperties": False,
@@ -35,21 +57,37 @@ DEV_AGENT_RESPONSE_SCHEMA = {
         "blocked_reason",
         "summary",
         "jira_key",
-        "diffs",
         "new_files",
+        "diffs",
     ],
     "properties": {
         "blocked": {"type": "boolean"},
         "blocked_reason": {"type": "string"},
         "summary": {"type": "string"},
         "jira_key": {"type": "string"},
-        "diffs": {
-            "type": "object",
-            "additionalProperties": {"type": "string"},
-        },
         "new_files": {
-            "type": "object",
-            "additionalProperties": {"type": "string"},
+            "type": "array",
+            "items": {
+                "type": "object",
+                "additionalProperties": False,
+                "required": ["path", "content"],
+                "properties": {
+                    "path": {"type": "string"},
+                    "content": {"type": "string"},
+                },
+            },
+        },
+        "diffs": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "additionalProperties": False,
+                "required": ["path", "diff"],
+                "properties": {
+                    "path": {"type": "string"},
+                    "diff": {"type": "string"},
+                },
+            },
         },
     },
 }
@@ -125,6 +163,27 @@ def _response_format(response_schema: Optional[dict]) -> dict:
             "schema": response_schema,
         },
     }
+
+
+_NON_RETRYABLE_STATUS_CODES = {400, 401}
+_RETRYABLE_STATUS_CODES = {429, 500, 502, 503, 504}
+
+
+def _diagnostic_hint(message: str) -> str:
+    if "additionalProperties" in message:
+        return (
+            " -- the response_schema itself is invalid for strict mode: "
+            "every object must set additionalProperties=false and enumerate "
+            "all properties by name (no arbitrary/dynamic keys)."
+        )
+    if "json_validate_failed" in message:
+        return (
+            " -- the model's generation didn't satisfy the schema before "
+            "running out of room. This usually means max_output_tokens is "
+            "too small for the required response (e.g. a full file rewrite "
+            "plus JSON/schema overhead) -- increase the output token budget."
+        )
+    return ""
 
 
 def call_groq_json(
@@ -211,18 +270,18 @@ def call_groq_json(
 
         except APIStatusError as error:
             last_error = error
-            if error.status_code in {
-                400,
-                401,
-                413,
-                429,
-                500,
-                502,
-                503,
-                504,
-            }:
+            if error.status_code in _RETRYABLE_STATUS_CODES:
                 key_pool.rotate_after_failure(key_index)
                 time.sleep(min(2 + attempt, 8))
+            elif error.status_code in _NON_RETRYABLE_STATUS_CODES:
+                # Deterministic failure -- identical on every key, every
+                # retry. Fail fast with the real cause instead of
+                # burning max_attempts to rediscover the same error.
+                message = str(error)
+                raise RuntimeError(
+                    f"Groq rejected the request (HTTP {error.status_code}, "
+                    f"non-retryable){_diagnostic_hint(message)}: {message}"
+                ) from error
             else:
                 raise
 

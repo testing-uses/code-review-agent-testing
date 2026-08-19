@@ -1,16 +1,29 @@
-"""agents/dev_agent/dev_agent.py
+"""agents/dev_agent/dev_agent.py  (v6)
 
-Strict Dev Agent implementation.
+CHANGES from v5 (the "strict" version):
+  - Adapted to the new array-based new_files/diffs wire format (see
+    groq_client.DEV_AGENT_RESPONSE_SCHEMA for why) -- _validate_edit_contract
+    now checks arrays of {path, content|diff} objects, and a new
+    _edits_to_dicts() converts them back into the plain {path: content}
+    dicts the apply logic already worked with, so nothing below that
+    point had to change.
+  - max_output_tokens is no longer a hardcoded 1500. Ground-truth file
+    injection was never counted against the DCBA-allocated budget at
+    all (up to ~7,200+ tokens uncapped, competing with a fixed 1500
+    output limit for the same ceiling) -- under strict-schema constrained
+    decoding, running out of room mid-generation doesn't degrade to
+    truncated-but-parseable JSON, it just fails outright with an empty
+    failed_generation. _compute_dynamic_budgets() now splits the actual
+    DCBA ceiling three ways (output / KB context / ground truth) so the
+    budget DCBA computed is the budget that's actually enforced, not
+    decorative.
+  - _build_ground_truth_block() now takes a real token budget and
+    truncates the AGGREGATE ground-truth text to fit it, instead of a
+    flat 6000-chars-per-file cap with no total limit.
 
-The model output contract is enforced at three levels:
-1. The system prompt requires one exact JSON shape.
-2. Groq receives a strict JSON Schema.
-3. Python validates the parsed response before applying anything.
-
-Existing files named in the task are supplied as exact ground truth and are
-returned as complete strings under new_files. Diffs are rejected for those
-files. No model-generated arrays, nested objects, or alternate file formats
-are accepted.
+Everything else (ground-truth enforcement at apply time, no-op diff
+rejection, rewrite-similarity guard, protected-path checks) is unchanged
+from v5 and still applies to the converted dict form.
 """
 
 from __future__ import annotations
@@ -31,6 +44,7 @@ bootstrap()
 
 from context_selector import select_context  # noqa: E402
 from groq_client import (  # noqa: E402
+    CHARS_PER_TOKEN_ESTIMATE,
     DEV_AGENT_RESPONSE_SCHEMA,
     GroqKeyPool,
     call_groq_json,
@@ -42,9 +56,14 @@ from patch_apply import apply_unified_diff, write_full_file  # noqa: E402
 PROMPTS_DIR = os.path.join(os.path.dirname(__file__), "..", "prompts")
 DEFAULT_MODEL = "openai/gpt-oss-120b"
 
-GROUND_TRUTH_MAX_CHARS_PER_FILE = 6000
 GROUND_TRUTH_MAX_FILES = 4
 REWRITE_SIMILARITY_FLOOR = 0.5
+
+# Dynamic budget split (see _compute_dynamic_budgets docstring).
+MIN_OUTPUT_TOKENS = 900
+MAX_OUTPUT_TOKENS_CAP = 4000
+OUTPUT_BUDGET_FRACTION = 0.35
+KB_CONTEXT_FRACTION_OF_REMAINDER = 0.35
 
 _EXCLUDED_DIR_NAMES = {
     ".git",
@@ -60,10 +79,30 @@ _EXCLUDED_DIR_NAMES = {
 }
 
 
+def _compute_dynamic_budgets(allocated_budget_tokens: int) -> Tuple[int, int, int]:
+    """Split the DCBA-allocated ceiling three ways instead of the old
+    fixed 0.6-for-KB-context / hardcoded-1500-for-output split that let
+    ground truth injection silently eat the whole budget.
+
+    Returns (output_budget_tokens, kb_context_budget_tokens, ground_truth_budget_tokens).
+    All three plus the system+user prompt overhead stay within
+    allocated_budget_tokens by construction, so preflight_check should
+    never reject a request assembled from these numbers under normal
+    conditions."""
+    output_budget = max(
+        MIN_OUTPUT_TOKENS,
+        min(MAX_OUTPUT_TOKENS_CAP, int(allocated_budget_tokens * OUTPUT_BUDGET_FRACTION)),
+    )
+    remainder = max(allocated_budget_tokens - output_budget, 400)
+    kb_budget = int(remainder * KB_CONTEXT_FRACTION_OF_REMAINDER)
+    ground_truth_budget = remainder - kb_budget
+    return output_budget, kb_budget, ground_truth_budget
+
+
 def _read_existing_file(
     repo_root: str,
     rel_path: str,
-    max_chars: int = GROUND_TRUTH_MAX_CHARS_PER_FILE,
+    max_chars: Optional[int] = None,
 ) -> Optional[str]:
     full_path = os.path.join(repo_root, rel_path)
 
@@ -76,10 +115,10 @@ def _read_existing_file(
     except (OSError, UnicodeDecodeError):
         return None
 
-    if len(content) > max_chars:
+    if max_chars is not None and len(content) > max_chars:
         content = (
             content[:max_chars]
-            + "\n...[truncated -- file longer than ground-truth limit]..."
+            + "\n...[truncated -- file longer than ground-truth budget]..."
         )
 
     return content
@@ -118,20 +157,30 @@ def _guess_target_files(task_text: str, repo_root: str) -> List[str]:
 def _build_ground_truth_block(
     repo_root: str,
     target_files: List[str],
+    budget_tokens: int,
 ) -> Tuple[str, Set[str]]:
+    """Truncates the AGGREGATE ground-truth block to fit budget_tokens
+    (not a flat per-file cap) -- so a task naming several files degrades
+    gracefully (later/larger files get less room, or get dropped) instead
+    of silently producing a prompt that blows past the DCBA ceiling."""
+    max_total_chars = max(int(budget_tokens * CHARS_PER_TOKEN_ESTIMATE), 500)
     blocks: List[str] = []
     verified: Set[str] = set()
+    used_chars = 0
 
     for rel_path in target_files:
-        content = _read_existing_file(repo_root, rel_path)
+        remaining_chars = max_total_chars - used_chars
+        if remaining_chars <= 200:
+            break  # not enough budget left for another file to be useful
+
+        content = _read_existing_file(repo_root, rel_path, max_chars=remaining_chars)
         if content is None:
             continue
 
         verified.add(rel_path)
-        blocks.append(
-            f"### EXACT CURRENT CONTENT of {rel_path}\n"
-            f"```python\n{content}\n```"
-        )
+        block = f"### EXACT CURRENT CONTENT of {rel_path}\n```python\n{content}\n```"
+        blocks.append(block)
+        used_chars += len(block)
 
     if not blocks:
         return (
@@ -174,6 +223,10 @@ def _diff_is_meaningful(diff_text: str) -> bool:
 
 
 def _validate_edit_contract(result: Any) -> Tuple[bool, str]:
+    """Validates the array-based wire format: new_files/diffs are arrays
+    of {path, content} / {path, diff} objects (see groq_client's schema
+    docstring for why -- strict mode can't express a dict keyed by
+    arbitrary file paths)."""
     if not isinstance(result, dict):
         return False, "response must be a JSON object"
 
@@ -196,31 +249,51 @@ def _validate_edit_contract(result: Any) -> Tuple[bool, str]:
         if not isinstance(result[field], str):
             return False, f"{field} must be a string"
 
-    for field in ("diffs", "new_files"):
+    for field, item_key in (("new_files", "content"), ("diffs", "diff")):
         value = result[field]
-        if not isinstance(value, dict):
-            return False, f"{field} must be an object"
+        if not isinstance(value, list):
+            return False, f"{field} must be an array"
 
-        for path, content in value.items():
-            if not isinstance(path, str):
-                return False, f"{field} contains a non-string path"
-            if not isinstance(content, str):
-                return False, (
-                    f"{field}[{path!r}] must be one complete string; "
-                    "arrays and nested objects are forbidden"
-                )
+        seen_paths: Set[str] = set()
+        for entry in value:
+            if not isinstance(entry, dict):
+                return False, f"{field} entries must be objects"
+            if set(entry.keys()) != {"path", item_key}:
+                return False, f"{field} entries must have exactly 'path' and '{item_key}'"
+            if not isinstance(entry["path"], str) or not isinstance(entry[item_key], str):
+                return False, f"{field} entries must have string 'path' and '{item_key}'"
+            if entry["path"] in seen_paths:
+                return False, f"{field} contains duplicate path: {entry['path']}"
+            seen_paths.add(entry["path"])
 
-    overlap = set(result["diffs"]) & set(result["new_files"])
+    new_file_paths = {entry["path"] for entry in result["new_files"]}
+    diff_paths = {entry["path"] for entry in result["diffs"]}
+    overlap = new_file_paths & diff_paths
     if overlap:
-        return False, f"paths appear in both output fields: {sorted(overlap)}"
+        return False, f"paths appear in both new_files and diffs: {sorted(overlap)}"
 
     if result["blocked"]:
-        if result["diffs"] or result["new_files"]:
-            return False, "blocked responses must contain empty edit objects"
-    elif not result["diffs"] and not result["new_files"]:
+        if result["new_files"] or result["diffs"]:
+            return False, "blocked responses must contain empty edit arrays"
+    elif not result["new_files"] and not result["diffs"]:
         return False, "unblocked responses must contain at least one edit"
 
     return True, ""
+
+
+def _edits_to_dicts(result: Dict[str, Any]) -> Tuple[Dict[str, str], Dict[str, str]]:
+    """Converts the wire format (arrays of {path, content|diff}) into the
+    {path: content} dicts the apply logic below expects -- keeps that
+    logic identical to before the schema had to switch to arrays."""
+    new_files = {
+        entry["path"].replace("\\", "/"): entry["content"]
+        for entry in result["new_files"]
+    }
+    diffs = {
+        entry["path"].replace("\\", "/"): entry["diff"]
+        for entry in result["diffs"]
+    }
+    return new_files, diffs
 
 
 def run(
@@ -229,12 +302,17 @@ def run(
     db_path: str,
     allocated_budget_tokens: int,
     model: str = DEFAULT_MODEL,
-    max_output_tokens: int = 1500,
+    max_output_tokens: Optional[int] = None,
 ) -> Dict[str, Any]:
     start_time = time.time()
     system_prompt = load_prompt(PROMPTS_DIR, "dev_agent_prompt.md")
 
-    context_budget = int(allocated_budget_tokens * 0.6)
+    computed_output_budget, context_budget, ground_truth_budget = _compute_dynamic_budgets(
+        allocated_budget_tokens
+    )
+    if max_output_tokens is None:
+        max_output_tokens = computed_output_budget
+
     if os.path.exists(db_path):
         connection = get_connection(db_path)
         try:
@@ -252,6 +330,7 @@ def run(
     ground_truth_block, verified_ground_truth_files = _build_ground_truth_block(
         repo_root,
         target_files,
+        budget_tokens=ground_truth_budget,
     )
 
     user_prompt = (
@@ -266,12 +345,15 @@ def run(
         "## Non-negotiable output contract\n"
         "Return exactly one JSON object and nothing else. The object must "
         "contain exactly these fields: blocked, blocked_reason, summary, "
-        "jira_key, diffs, new_files. The values of diffs and new_files "
-        "must be JSON objects whose values are single complete strings. "
-        "Never return arrays of lines, nested objects, null, numbers, "
-        "Markdown, or prose. For an existing ground-truth file, return "
-        "the complete updated file as one string in new_files. If blocked "
-        "is true, both edit objects must be empty."
+        "jira_key, new_files, diffs. new_files and diffs are JSON ARRAYS; "
+        "each element is an object with exactly two string fields -- "
+        "{\"path\": ..., \"content\": ...} for new_files, "
+        "{\"path\": ..., \"diff\": ...} for diffs. Never repeat the same "
+        "path twice within one array, and never put the same path in both "
+        "arrays. Never return arrays of lines, nested objects, null, "
+        "numbers, Markdown, or prose. For an existing ground-truth file, "
+        "return the complete updated file as one string in a new_files "
+        "entry. If blocked is true, both arrays must be empty."
     )
 
     key_pool = GroqKeyPool()
@@ -310,25 +392,18 @@ def run(
             "latency_ms": latency_ms,
         }
 
-    diffs = result["diffs"]
-    new_files = result["new_files"]
+    new_files, diffs = _edits_to_dicts(result)
     changed_files: List[str] = []
     apply_errors: List[str] = []
 
     for rel_path, content in new_files.items():
-        rel_path = rel_path.replace("\\", "/")
-
         if rel_path.startswith("agents/") or rel_path.startswith(".github/"):
             apply_errors.append(
                 f"{rel_path}: protected platform path cannot be modified"
             )
             continue
 
-        existing_content = _read_existing_file(
-            repo_root,
-            rel_path,
-            max_chars=1_000_000,
-        )
+        existing_content = _read_existing_file(repo_root, rel_path)
 
         if (
             existing_content is not None
@@ -356,8 +431,6 @@ def run(
             apply_errors.append(f"{rel_path}: {error}")
 
     for rel_path, diff_text in diffs.items():
-        rel_path = rel_path.replace("\\", "/")
-
         if rel_path.startswith("agents/") or rel_path.startswith(".github/"):
             apply_errors.append(
                 f"{rel_path}: protected platform path cannot be modified"
