@@ -257,6 +257,7 @@ def run_pipeline(
     state = transition(state, WorkflowState.CODE_REVIEW_IN_PROGRESS)
     emit("code_review_started", pull_request=pr_number, allocated_tokens=budgets["code_review_agent"])
 
+    review_start = time.time()
     try:
         from run_review import run_review_for_pr  # noqa: E402
 
@@ -274,11 +275,28 @@ def run_pipeline(
         review_result = {"action": "ERROR"}
         review_error = str(error)
 
+    review_latency = (time.time() - review_start) * 1000
     report["code_review_agent"] = review_result
     decision_action = review_result.get("action")
     emit("code_review_finished", action=decision_action, result=review_result, error=review_error)
 
-    review_actual_tokens = None  # review agent doesn't return usage yet — see note below
+    review_usage = review_result.get("usage", {})
+    review_actual_tokens = review_usage.get("total_tokens") or 0
+    new_review_ema = update_ema(review_ema, review_actual_tokens) if review_actual_tokens else review_ema
+    record_metric(
+        METRICS_PATH,
+        build_metric(
+            agent="code_review_agent",
+            task_id=task_id,
+            allocated_budget_tokens=budgets["code_review_agent"],
+            actual_prompt_tokens=review_usage.get("prompt_tokens"),
+            actual_completion_tokens=review_usage.get("completion_tokens"),
+            latency_ms=review_latency,
+            result_status=decision_action or "ERROR",
+            ema_total_tokens=new_review_ema,
+            extra={"weighted_score": review_result.get("weighted_score")},
+        ),
+    )
 
     if review_error is not None:
         # Fail closed: review genuinely did not run. Don't pretend it did
@@ -316,8 +334,8 @@ def run_pipeline(
             model=DEFAULT_MODEL,
             system_prompt=summary_prompt,
             user_prompt=summary_user_prompt,
-            max_output_tokens=400,
-            token_ceiling=2000,
+            max_output_tokens=250,
+            token_ceiling=1500,
         )
         summary.pop("_usage", None)
         report["human_readable_summary"] = summary

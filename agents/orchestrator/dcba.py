@@ -56,14 +56,22 @@ def allocate_budgets(
     complexity_scores: Dict[str, float],
     total_budget: int = DEFAULT_TOTAL_BUDGET,
     min_budget: int = MIN_BUDGET_PER_AGENT,
+    temperature: float = 10.0,
 ) -> Dict[str, int]:
-    """Softmax-weighted split of total_budget across agents, then clamp each
-    to a minimum floor and re-normalize so the sum still equals total_budget."""
+    """Numerically stable, temperature-scaled Softmax split of total_budget across agents,
+    then clamp each to a minimum floor and re-normalize so the sum still equals total_budget."""
     if not complexity_scores:
         return {}
 
-    exp_scores = {name: math.exp(score) for name, score in complexity_scores.items()}
-    total_exp = sum(exp_scores.values())
+    # Subtract max for numerical stability (prevents overflow for large scores)
+    max_score = max(complexity_scores.values())
+    temp = max(temperature, 0.1)
+
+    exp_scores = {
+        name: math.exp((score - max_score) / temp)
+        for name, score in complexity_scores.items()
+    }
+    total_exp = sum(exp_scores.values()) or 1.0
 
     raw_budgets = {
         name: (exp_score / total_exp) * total_budget

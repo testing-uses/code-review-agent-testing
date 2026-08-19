@@ -18,7 +18,19 @@ B = 0.75
 
 
 def tokenize(text: str) -> List[str]:
-    return [t for t in re.findall(r"[a-zA-Z_][a-zA-Z0-9_]*", text.lower()) if len(t) > 2]
+    raw_tokens = re.findall(r"[a-zA-Z_][a-zA-Z0-9_]*", text)
+    tokens = []
+    for tok in raw_tokens:
+        tok_lower = tok.lower()
+        if len(tok_lower) > 2:
+            tokens.append(tok_lower)
+        # Split camelCase and snake_case sub-tokens for keyword matching
+        sub_tokens = re.findall(r"[a-z]+|[A-Z][a-z]*|\d+", tok)
+        for st in sub_tokens:
+            st_lower = st.lower()
+            if len(st_lower) > 2 and st_lower != tok_lower:
+                tokens.append(st_lower)
+    return tokens
 
 
 def compute_bm25_scores(query_text: str, documents: Dict[str, str]) -> Dict[str, float]:

@@ -77,9 +77,7 @@ def _identify_seed_symbols(query_text: str, all_symbol_names: Set[str]) -> Set[s
 def _mmr_select(candidates: List[ContextEntry], budget_tokens: int, mmr_lambda: float = MMR_LAMBDA) -> List[ContextEntry]:
     """Budget-constrained MMR: repeatedly pick the candidate that best
     trades off relevance against redundancy with what's already selected,
-    normalized by token cost (so a cheap-but-good entry isn't starved by
-    an expensive-but-slightly-better one). O(n^2) in candidate count,
-    which is fine since candidates is already capped upstream."""
+    normalized by token cost. Eliminates negative division anomalies."""
     selected: List[ContextEntry] = []
     remaining = list(candidates)
     used_tokens = 0
@@ -90,18 +88,29 @@ def _mmr_select(candidates: List[ContextEntry], budget_tokens: int, mmr_lambda: 
             break
 
         best_entry = None
-        best_mmr = float("-inf")
+        best_efficiency = float("-inf")
         for candidate in affordable:
             redundancy = 0.0
             if selected:
                 redundancy = max(
                     _cosine_similarity(candidate.term_vector, s.term_vector) for s in selected
                 )
-            mmr_score = mmr_lambda * candidate.fused_score - (1 - mmr_lambda) * redundancy
-            mmr_score = mmr_score / max(candidate.token_cost, 1)
-            if mmr_score > best_mmr:
-                best_mmr = mmr_score
+            marginal_utility = mmr_lambda * candidate.fused_score - (1 - mmr_lambda) * redundancy
+            
+            # Density ratio: positive utility is boosted by low token cost;
+            # negative utility (pure redundancy) is heavily discounted
+            if marginal_utility > 0:
+                efficiency = marginal_utility / max(candidate.token_cost, 1)
+            else:
+                efficiency = marginal_utility * max(candidate.token_cost, 1)
+
+            if efficiency > best_efficiency:
+                best_efficiency = efficiency
                 best_entry = candidate
+
+        if not best_entry or (selected and best_efficiency < 0):
+            # If remaining affordable candidates only add pure redundancy, stop to conserve budget
+            break
 
         selected.append(best_entry)
         used_tokens += best_entry.token_cost

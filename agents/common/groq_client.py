@@ -179,13 +179,86 @@ def _extract_result(response: Any, provider: str) -> Dict[str, Any]:
     return result
 
 
+def call_gemini_json(
+    model: str,
+    system_prompt: str,
+    user_prompt: str,
+    max_output_tokens: int,
+    response_schema: Optional[dict] = None,
+) -> Dict[str, Any]:
+    """Call Google Gemini API with JSON output mode."""
+    import urllib.request
+    import urllib.error
+
+    api_key = os.getenv("GEMINI_API_KEY")
+    if not api_key:
+        raise RuntimeError("GEMINI_API_KEY is not configured.")
+
+    clean_model = model.replace("models/", "")
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{clean_model}:generateContent?key={api_key}"
+
+    payload: Dict[str, Any] = {
+        "contents": [
+            {"role": "user", "parts": [{"text": user_prompt}]}
+        ],
+        "generationConfig": {
+            "responseMimeType": "application/json",
+            "temperature": 0.0,
+            "maxOutputTokens": max_output_tokens,
+        }
+    }
+    if system_prompt and system_prompt.strip():
+        payload["systemInstruction"] = {
+            "parts": [{"text": system_prompt}]
+        }
+    if response_schema:
+        payload["generationConfig"]["responseSchema"] = response_schema
+
+    req = urllib.request.Request(
+        url,
+        data=json.dumps(payload).encode("utf-8"),
+        headers={"Content-Type": "application/json"}
+    )
+    try:
+        with urllib.request.urlopen(req) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+            candidates = data.get("candidates", [])
+            if not candidates or "content" not in candidates[0]:
+                raise RuntimeError(f"Gemini API returned no candidate content: {data}")
+            content_text = candidates[0]["content"]["parts"][0]["text"]
+            result = json.loads(content_text)
+            if not isinstance(result, dict):
+                raise RuntimeError("Gemini returned JSON, but it was not an object.")
+
+            usage = data.get("usageMetadata", {})
+            result["_usage"] = {
+                "prompt_tokens": usage.get("promptTokenCount"),
+                "completion_tokens": usage.get("candidatesTokenCount"),
+                "total_tokens": usage.get("totalTokenCount"),
+                "provider": "gemini",
+            }
+            return result
+    except urllib.error.HTTPError as error:
+        err_body = error.read().decode("utf-8")
+        raise RuntimeError(f"Gemini API HTTP Error {error.code}: {err_body}") from error
+
+
 def call_cerebras_json(
     model: str,
     system_prompt: str,
     user_prompt: str,
     max_output_tokens: int,
 ) -> Dict[str, Any]:
-    """Call Cerebras through its OpenAI-compatible API."""
+    """Call Gemini if GEMINI_API_KEY is configured, else fallback to Cerebras."""
+    if os.getenv("GEMINI_API_KEY"):
+        gemini_model = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
+        return call_gemini_json(
+            model=gemini_model,
+            system_prompt=system_prompt,
+            user_prompt=user_prompt,
+            max_output_tokens=max_output_tokens,
+        )
+
     try:
         from openai import OpenAI
     except ImportError as error:
@@ -196,7 +269,7 @@ def call_cerebras_json(
 
     api_key = os.getenv("CEREBRAS_API_KEY")
     if not api_key:
-        raise RuntimeError("CEREBRAS_API_KEY is not configured.")
+        raise RuntimeError("Neither GEMINI_API_KEY nor CEREBRAS_API_KEY is configured.")
 
     client = OpenAI(
         api_key=api_key,
@@ -217,8 +290,6 @@ def call_cerebras_json(
         ],
         temperature=0,
         max_tokens=max_output_tokens,
-        # Cerebras is called with generic JSON mode here. Python-side
-        # validation remains the final contract enforcement layer.
         response_format={"type": "json_object"},
     )
 

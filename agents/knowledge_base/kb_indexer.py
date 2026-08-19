@@ -24,8 +24,12 @@ from typing import Dict, List, Set, Tuple
 from kb_schema import get_connection
 
 STOPWORDS = {
-    "self", "def", "return", "the", "and", "for", "with", "from", "import",
-    "if", "else", "elif", "none", "true", "false", "int", "str", "list",
+    "self", "cls", "def", "return", "the", "and", "for", "with", "from", "import",
+    "as", "if", "else", "elif", "none", "true", "false", "int", "str", "list",
+    "dict", "set", "tuple", "bool", "float", "optional", "any", "union", "args",
+    "kwargs", "class", "pass", "raise", "except", "try", "finally", "while",
+    "break", "continue", "in", "not", "is", "or", "lambda", "yield", "async",
+    "await", "init", "main", "type", "object",
 }
 
 
@@ -38,8 +42,19 @@ def git_blob_sha(repo_root: str, rel_path: str) -> str:
 
 
 def tokenize(text: str) -> List[str]:
-    tokens = re.findall(r"[a-zA-Z_][a-zA-Z0-9_]*", text.lower())
-    return [t for t in tokens if t not in STOPWORDS and len(t) > 2]
+    raw_tokens = re.findall(r"[a-zA-Z_][a-zA-Z0-9_]*", text)
+    tokens = []
+    for tok in raw_tokens:
+        tok_lower = tok.lower()
+        if len(tok_lower) > 2 and tok_lower not in STOPWORDS:
+            tokens.append(tok_lower)
+        # Split camelCase and snake_case sub-tokens
+        sub_tokens = re.findall(r"[a-z]+|[A-Z][a-z]*|\d+", tok)
+        for st in sub_tokens:
+            st_lower = st.lower()
+            if len(st_lower) > 2 and st_lower != tok_lower and st_lower not in STOPWORDS:
+                tokens.append(st_lower)
+    return tokens
 
 
 def term_vector(*text_parts: str) -> Dict[str, int]:

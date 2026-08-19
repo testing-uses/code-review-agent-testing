@@ -168,6 +168,11 @@ def personalized_pagerank(
             share = damping * rank[node] / len(out_links)
             for target in out_links:
                 new_rank[target] = new_rank.get(target, 0.0) + share
+
+        # Convergence check: stop early if rank values stabilize
+        delta = sum(abs(new_rank[node] - rank[node]) for node in nodes)
         rank = new_rank
+        if delta < 1e-6:
+            break
 
     return dict(sorted(rank.items(), key=lambda item: item[1], reverse=True))

@@ -71,7 +71,7 @@ def review_pull_request(
         user_prompt=reviewer_user, max_output_tokens=max_output_tokens,
         token_ceiling=token_ceiling,
     )
-    raw_review.pop("_usage", None)
+    raw_usage = raw_review.pop("_usage", {}) or {}
 
     raw_categories = raw_review.get("categories", {}) or {}
     emit("raw_findings_generated",
@@ -96,6 +96,7 @@ def review_pull_request(
             "category_scores": category_scores,
             "verified_findings": [],
             "overall_summary": raw_review.get("overall_summary", ""),
+            "usage": raw_usage,
         }
 
     # ---- Stage 2: skeptical verification ----
@@ -104,12 +105,17 @@ def review_pull_request(
         f"## Candidate findings\n{json.dumps(all_findings)}\n\n"
         f"## Context\n{context_text}"
     )
+    verifier_max_tokens = min(max_output_tokens, max(350, len(all_findings) * 200))
     verified = call_groq_json(
         key_pool=key_pool, model=model, system_prompt=verifier_system,
-        user_prompt=verifier_user, max_output_tokens=max_output_tokens,
+        user_prompt=verifier_user, max_output_tokens=verifier_max_tokens,
         token_ceiling=token_ceiling,
     )
-    verified.pop("_usage", None)
+    verifier_usage = verified.pop("_usage", {}) or {}
+
+    total_prompt_tokens = (raw_usage.get("prompt_tokens") or 0) + (verifier_usage.get("prompt_tokens") or 0)
+    total_completion_tokens = (raw_usage.get("completion_tokens") or 0) + (verifier_usage.get("completion_tokens") or 0)
+    total_tokens = (raw_usage.get("total_tokens") or 0) + (verifier_usage.get("total_tokens") or 0)
 
     verified_findings = [
         f for f in verified.get("verified_findings", [])
@@ -118,11 +124,19 @@ def review_pull_request(
 
     # The verifier prompt's output schema doesn't carry `category` back —
     # decision_engine's hard-gate check needs it, so re-attach by
-    # matching on (file, title), falling back to the finding's own
-    # severity-neutral default rather than silently dropping the gate check.
+    # matching on (file, title), falling back to closest match or default category
+    # rather than silently dropping the gate check.
     category_lookup = {(f.get("file"), f.get("title")): f["category"] for f in all_findings}
     for f in verified_findings:
-        f["category"] = category_lookup.get((f.get("file"), f.get("title")))
+        cat = category_lookup.get((f.get("file"), f.get("title")))
+        if not cat:
+            for orig in all_findings:
+                if orig.get("file") == f.get("file") and (
+                    orig.get("title", "") in f.get("title", "") or f.get("title", "") in orig.get("title", "")
+                ):
+                    cat = orig.get("category")
+                    break
+        f["category"] = cat or (all_findings[0]["category"] if all_findings else "correctness")
 
     emit("findings_verified",
          submitted=len(all_findings),
@@ -134,4 +148,9 @@ def review_pull_request(
         "category_scores": category_scores,
         "verified_findings": verified_findings,
         "overall_summary": raw_review.get("overall_summary", ""),
+        "usage": {
+            "prompt_tokens": total_prompt_tokens,
+            "completion_tokens": total_completion_tokens,
+            "total_tokens": total_tokens,
+        },
     }

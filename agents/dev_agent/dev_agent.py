@@ -30,6 +30,7 @@ from groq_client import (  # noqa: E402
     DEV_AGENT_RESPONSE_SCHEMA,
     GroqKeyPool,
     call_cerebras_json,
+    call_gemini_json,
     call_groq_json,
     estimate_tokens,
     load_prompt,
@@ -40,7 +41,7 @@ from patch_apply import apply_unified_diff, write_full_file  # noqa: E402
 PROMPTS_DIR = os.path.join(os.path.dirname(__file__), "..", "prompts")
 DEFAULT_PROVIDER = os.environ.get(
     "DEV_AGENT_PROVIDER",
-    "cerebras",
+    "gemini" if os.getenv("GEMINI_API_KEY") else "groq",
 ).lower()
 
 DEFAULT_MODEL = os.environ.get(
@@ -50,9 +51,9 @@ DEFAULT_MODEL = os.environ.get(
 
 GROUND_TRUTH_MAX_FILES = 4
 REWRITE_SIMILARITY_FLOOR = 0.5
-PRELIM_OUTPUT_FRACTION = 0.35
+PRELIM_OUTPUT_FRACTION = 0.30
 PRELIM_KB_FRACTION_OF_REMAINDER = 0.35
-MIN_OUTPUT_TOKENS = 2500
+MIN_OUTPUT_TOKENS = 1200
 MAX_OUTPUT_TOKENS_CAP = 8000
 PROMPT_SAFETY_MARGIN_TOKENS = 200
 
@@ -308,6 +309,16 @@ def _call_provider(
     max_output_tokens: int,
     allocated_budget_tokens: int,
 ) -> Dict[str, Any]:
+    if provider == "gemini":
+        gemini_model = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
+        return call_gemini_json(
+            model=gemini_model,
+            system_prompt=system_prompt,
+            user_prompt=user_prompt,
+            max_output_tokens=max_output_tokens,
+            response_schema=DEV_AGENT_RESPONSE_SCHEMA,
+        )
+
     if provider == "cerebras":
         cerebras_model = os.getenv(
             "CEREBRAS_MODEL",

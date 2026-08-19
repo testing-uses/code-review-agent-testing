@@ -157,6 +157,7 @@ def run_review_for_pr(
         "weighted_score": decision.weighted_score,
         "reasons": decision.reasons,
         "severity_counts": decision.findings_by_severity,
+        "usage": review_result.get("usage", {}),
     }
 
 

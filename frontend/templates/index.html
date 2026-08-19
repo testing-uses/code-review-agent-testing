@@ -2,53 +2,162 @@
 <html lang="en">
 <head>
 <meta charset="UTF-8">
-<title>Agentic AI Pipeline</title>
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Agentic AI Pipeline - Dynamic Trace</title>
 <style>
-  body { font-family: -apple-system, Segoe UI, Roboto, sans-serif; max-width: 820px; margin: 40px auto; color: #1a1a1a; }
-  h1 { margin-bottom: 4px; }
-  .subtitle { color: #555; margin-bottom: 24px; }
-  textarea { width: 100%; box-sizing: border-box; font-family: monospace; font-size: 14px; padding: 10px; }
-  button { margin-top: 12px; padding: 8px 18px; cursor: pointer; }
-  #runStatusText { margin-top: 16px; font-weight: 500; }
-  #timeline { margin-top: 20px; border-left: 2px solid #ddd; padding-left: 20px; }
-  .timeline-item { position: relative; margin-bottom: 18px; }
-  .timeline-dot { position: absolute; left: -27px; top: 4px; width: 10px; height: 10px; border-radius: 50%; background: #999; }
-  .timeline-item.info .timeline-dot { background: #2b8a3e; }
-  .timeline-item.error .timeline-dot { background: #c92a2a; }
-  .timeline-title { font-weight: 600; }
-  .timeline-item time { font-size: 12px; color: #888; margin-left: 8px; }
-  .timeline-item pre { background: #f6f6f6; padding: 8px; border-radius: 4px; font-size: 12px; overflow-x: auto; margin: 6px 0 0 0; }
-  .job-summary { display: flex; gap: 12px; margin-top: 10px; flex-wrap: wrap; }
-  .job-pill { border: 1px solid #ddd; border-radius: 16px; padding: 4px 12px; font-size: 13px; }
-  .job-pill.success { border-color: #2b8a3e; color: #2b8a3e; }
-  .job-pill.failure { border-color: #c92a2a; color: #c92a2a; }
-  .past-runs { margin-top: 30px; }
-  .run-card { border: 1px solid #eee; border-radius: 6px; padding: 12px; margin-bottom: 10px; }
+  :root {
+    --bg: #090a0f;
+    --bg-card: rgba(255, 255, 255, 0.03);
+    --border: rgba(255, 255, 255, 0.08);
+    --text-hi: #f3f4f6;
+    --text: #d1d5db;
+    --text-muted: #9ca3af;
+    --accent: #8b5cf6;
+    --accent-grad: linear-gradient(135deg, #a855f7, #6366f1);
+    --success: #10b981;
+    --error: #ef4444;
+    --warning: #f59e0b;
+    --font-sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    --font-mono: ui-monospace, "Cascadia Code", Consolas, monospace;
+  }
+
+  body {
+    background: var(--bg);
+    font-family: var(--font-sans);
+    max-width: 900px;
+    margin: 40px auto;
+    padding: 0 20px;
+    color: var(--text);
+    line-height: 1.5;
+  }
+
+  h1 { color: var(--text-hi); margin-bottom: 6px; font-size: 28px; }
+  h1 span { background: var(--accent-grad); -webkit-background-clip: text; -webkit-text-fill-color: transparent; }
+  .subtitle { color: var(--text-muted); font-size: 13.5px; margin-bottom: 24px; }
+
+  .submit-card {
+    background: var(--bg-card);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 20px;
+    margin-bottom: 24px;
+    backdrop-filter: blur(12px);
+  }
+
+  textarea {
+    width: 100%;
+    box-sizing: border-box;
+    font-family: var(--font-mono);
+    font-size: 13.5px;
+    padding: 12px 14px;
+    background: rgba(0,0,0,0.4);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    color: var(--text-hi);
+    resize: vertical;
+    outline: none;
+  }
+  textarea:focus { border-color: var(--accent); }
+
+  .submit-row { display: flex; align-items: center; gap: 12px; margin-top: 12px; }
+  button.btn-primary {
+    background: var(--accent-grad);
+    color: #fff;
+    border: none;
+    padding: 10px 20px;
+    border-radius: 8px;
+    font-weight: 600;
+    cursor: pointer;
+    box-shadow: 0 0 14px rgba(139,92,246,0.3);
+  }
+  button.btn-primary:hover { opacity: 0.9; }
+
+  /* Flow Track */
+  .flow-track {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    background: var(--bg-card);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 16px;
+    margin-bottom: 20px;
+    overflow-x: auto;
+  }
+  .flow-step { display: flex; flex-direction: column; align-items: center; gap: 6px; font-size: 11px; color: var(--text-muted); min-width: 90px; }
+  .step-icon { width: 34px; height: 34px; border-radius: 50%; background: rgba(255,255,255,0.05); border: 2px solid var(--border); display: flex; align-items: center; justify-content: center; font-size: 15px; }
+  .flow-step.active .step-icon { border-color: var(--accent); background: rgba(139,92,246,0.2); box-shadow: 0 0 12px rgba(139,92,246,0.4); }
+  .flow-step.completed .step-icon { border-color: var(--success); background: rgba(16,185,129,0.15); }
+  .flow-step.active { color: var(--text-hi); font-weight: 700; }
+  .flow-line { flex: 1; height: 2px; background: var(--border); margin: 0 4px; position: relative; top: -10px; }
+  .flow-line.filled { background: var(--success); }
+
+  /* Metrics Grid */
+  .metrics-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+    gap: 12px;
+    margin-bottom: 24px;
+  }
+  .m-card { background: var(--bg-card); border: 1px solid var(--border); border-radius: 10px; padding: 12px 14px; }
+  .m-title { font-size: 10px; font-weight: 700; color: var(--text-muted); text-transform: uppercase; }
+  .m-val { font-size: 18px; font-weight: 700; font-family: var(--font-mono); color: var(--text-hi); margin-top: 2px; }
+
+  /* Timeline */
+  .timeline { position: relative; padding-left: 28px; margin-top: 20px; }
+  .timeline::before { content: ''; position: absolute; left: 7px; top: 8px; bottom: 8px; width: 2px; background: linear-gradient(to bottom, var(--accent), rgba(255,255,255,0.05)); }
+  .timeline-item { position: relative; margin-bottom: 16px; }
+  .timeline-dot { position: absolute; left: -25px; top: 12px; width: 10px; height: 10px; border-radius: 50%; background: var(--text-muted); }
+  .timeline-dot.success { background: var(--success); box-shadow: 0 0 8px rgba(16,185,129,0.5); }
+  .timeline-dot.active { background: var(--accent); box-shadow: 0 0 8px rgba(139,92,246,0.6); }
+  .timeline-dot.error { background: var(--error); box-shadow: 0 0 8px rgba(239,68,68,0.5); }
+
+  .timeline-card {
+    background: var(--bg-card);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 12px 16px;
+  }
+  .card-head { display: flex; align-items: center; gap: 8px; margin-bottom: 6px; }
+  .agent-tag { font-size: 10px; font-weight: 700; padding: 2px 7px; border-radius: 4px; text-transform: uppercase; background: rgba(139,92,246,0.2); color: #c084fc; }
+  .card-title { font-size: 13.5px; font-weight: 600; color: var(--text-hi); flex: 1; }
+  .card-time { font-size: 11px; color: var(--text-muted); }
+
+  pre { background: rgba(0,0,0,0.4); padding: 10px; border-radius: 6px; font-family: var(--font-mono); font-size: 12px; overflow-x: auto; margin: 6px 0 0 0; color: var(--text); }
+  .pill { font-size: 11px; padding: 2px 8px; border-radius: 4px; display: inline-block; margin-right: 6px; font-weight: 600; }
+  .pill.green { background: rgba(16,185,129,0.2); color: #34d399; }
+  .pill.yellow { background: rgba(245,158,11,0.2); color: #fbbf24; }
+  .pill.red { background: rgba(239,68,68,0.2); color: #f87171; }
+
+  .past-runs { margin-top: 36px; }
+  .run-card { background: var(--bg-card); border: 1px solid var(--border); border-radius: 8px; padding: 12px; margin-bottom: 10px; display: flex; justify-content: space-between; align-items: center; }
+  a { color: #60a5fa; text-decoration: none; }
 </style>
 </head>
 <body>
 
-<h1>Agentic AI Pipeline</h1>
+<h1>Agentic AI <span>Pipeline</span></h1>
 <p class="subtitle">
-  Submit a task. Dev Agent, Orchestrator, and Code Review Agent all run inside
-  GitHub Actions -- this avoids any local/org network restriction on reaching Groq.
+  Autonomous Orchestrator, Dev Agent, and Two-Stage Code Reviewer running in GitHub Actions with live trace.
 </p>
 
-<textarea id="taskText" rows="6" placeholder="create a function for overdue list"></textarea>
-<br>
-<button id="submitBtn">Submit Task</button>
-
-<div id="runStatusText"></div>
-<div id="jobSummary" class="job-summary"></div>
-<div id="timeline"></div>
-
-<div class="full-logs">
-  <button id="toggleLogsBtn" type="button">Show full raw logs</button>
-  <div id="fullLogs" style="display:none;"></div>
+<div class="submit-card">
+  <textarea id="taskText" rows="4" placeholder="e.g. fix Loan dataclass initialization bug in models.py"></textarea>
+  <div class="submit-row">
+    <button id="submitBtn" class="btn-primary">Submit Task to Orchestrator</button>
+    <span id="runStatusText" style="font-size:13px; color:var(--text-muted);"></span>
+  </div>
 </div>
 
+<div id="flowTrack" class="flow-track" style="display:none;"></div>
+<div id="tokenMetrics" class="metrics-grid" style="display:none;"></div>
+<div id="jobSummary" style="display:flex; gap:8px; margin-bottom:16px;"></div>
+
+<h3 style="font-size:14px; text-transform:uppercase; color:var(--text-muted); letter-spacing:0.8px; margin-top:24px;">Agent Execution Trace</h3>
+<div id="timeline" class="timeline"></div>
+
 <div class="past-runs">
-  <h3>Recent runs</h3>
+  <h3 style="font-size:14px; text-transform:uppercase; color:var(--text-muted); letter-spacing:0.8px;">Recent Pipeline Runs</h3>
   <div id="pastRuns"></div>
 </div>
 
@@ -56,129 +165,159 @@
 let activeRunId = null;
 let pollHandle = null;
 
-const EVENT_LABELS = {
-  received_task: "Task received",
-  repository_scanned: "Repository scanned",
-  knowledge_base_built: "Knowledge base built",
-  knowledge_base_retrieved: "Context retrieved",
-  graph_context_built: "Graph context built",
-  dcba_allocated: "Token budget allocated",
-  dev_agent_started: "Dev Agent started",
-  dev_agent_completed: "Dev Agent completed",
-  branch_created: "Branch created",
-  pull_request_created: "Pull request created",
-  code_review_started: "Code Review Agent started",
-  completed: "Pipeline completed"
+const EVENT_CONFIG = {
+  task_received: { label: "Task Received by Orchestrator", agent: "Orchestrator", code: "ORCH" },
+  knowledge_base_checked: { label: "Knowledge Base Verified", agent: "Knowledge Base", code: "KB" },
+  knowledge_base_context_analyzed: { label: "AST Context Footprint Analyzed", agent: "Knowledge Base", code: "KB" },
+  dcba_allocated: { label: "DCBA Phase 1: Budget Allocated", agent: "DCBA Engine", code: "DCBA" },
+  dev_agent_started: { label: "Dev Agent Dispatched", agent: "Dev Agent", code: "DEV" },
+  dev_agent_finished: { label: "Dev Agent Completed Synthesis", agent: "Dev Agent", code: "DEV" },
+  git_operations_started: { label: "Git Branching Started", agent: "GitOps", code: "GIT" },
+  branch_pushed: { label: "Branch Pushed", agent: "GitOps", code: "GIT" },
+  pull_request_created: { label: "Pull Request Created", agent: "GitHub Bot", code: "PR" },
+  dcba_review_budget_refined: { label: "DCBA Phase 2: Diff Refinement", agent: "DCBA Engine", code: "DCBA" },
+  code_review_started: { label: "Code Review Initialized", agent: "Code Reviewer", code: "REVIEW" },
+  review_files_identified: { label: "Reviewable Files Filtered", agent: "Code Reviewer", code: "REVIEW" },
+  review_context_built: { label: "Review Context Built", agent: "Code Reviewer", code: "REVIEW" },
+  raw_findings_generated: { label: "Stage 1: Findings Generated", agent: "Code Reviewer", code: "REVIEW" },
+  findings_verified: { label: "Stage 2: Skeptical Verification", agent: "Verifier", code: "VERIFY" },
+  breaking_change_detected: { label: "Breaking Change Detected", agent: "AST Dependency", code: "WARN" },
+  review_decision_made: { label: "Decision Engine Evaluated", agent: "Decision Engine", code: "GATE" },
+  review_posted_to_github: { label: "Review Posted to GitHub", agent: "GitHub Bot", code: "PR" },
+  code_review_finished: { label: "Code Review Finished", agent: "Code Reviewer", code: "REVIEW" },
+  human_approval_required: { label: "Human Gatekeeper Required", agent: "State Machine", code: "GATE" },
+  summary_generated: { label: "Executive Summary Ready", agent: "Orchestrator", code: "ORCH" },
+  pipeline_finished: { label: "Pipeline Finished Successfully", agent: "Orchestrator", code: "DONE" },
+  workflow_failed: { label: "Pipeline Step Failed", agent: "State Machine", code: "HALT" },
 };
 
 function escapeHtml(value) {
   return String(value)
-    .replaceAll("&", "&amp;")
-    .replaceAll("<", "&lt;")
-    .replaceAll(">", "&gt;")
-    .replaceAll('"', "&quot;")
-    .replaceAll("'", "&#039;");
+    .replaceAll("&", "&amp;").replaceAll("<", "&lt;").replaceAll(">", "&gt;")
+    .replaceAll('"', "&quot;").replaceAll("'", "&#039;");
 }
 
-function eventTitle(event) {
-  return EVENT_LABELS[event.event] || event.event;
+function renderFlow(events) {
+  const container = document.getElementById("flowTrack");
+  container.style.display = "flex";
+  const evSet = new Set(events.map(e => e.event));
+  const stages = [
+    { label: "1. Task & KB", code: "01", done: evSet.has("knowledge_base_checked") },
+    { label: "2. DCBA Budget", code: "02", done: evSet.has("dcba_allocated") },
+    { label: "3. Dev Agent", code: "03", done: evSet.has("dev_agent_finished") },
+    { label: "4. GitOps PR", code: "04", done: evSet.has("pull_request_created") },
+    { label: "5. Code Review", code: "05", done: evSet.has("code_review_finished") },
+    { label: "6. Gate Decision", code: "06", done: evSet.has("pipeline_finished") || evSet.has("human_approval_required") }
+  ];
+
+  container.innerHTML = stages.map((s, i) => `
+    <div class="flow-step ${s.done ? 'completed' : 'active'}">
+      <div class="step-icon">${s.code}</div>
+      <span>${s.label}</span>
+    </div>
+    ${i < stages.length - 1 ? `<div class="flow-line ${s.done ? 'filled' : ''}"></div>` : ''}
+  `).join("");
+}
+
+function renderMetrics(events) {
+  const container = document.getElementById("tokenMetrics");
+  const dcba = events.find(e => e.event === 'dcba_allocated');
+  const dev = events.find(e => e.event === 'dev_agent_finished');
+  const rev = events.find(e => e.event === 'code_review_finished');
+  if (!dcba && !dev) return;
+
+  container.style.display = "grid";
+  const devTok = dev?.usage?.total_tokens || 0;
+  const revTok = rev?.result?.usage?.total_tokens || 0;
+  const devAlloc = dcba?.dev_agent_tokens || 0;
+
+  container.innerHTML = `
+    <div class="m-card">
+      <div class="m-title">Total Budget Cap</div>
+      <div class="m-val">${(dcba?.total_budget || 11000).toLocaleString()} <span style="font-size:11px;color:var(--text-muted);">tok</span></div>
+    </div>
+    <div class="m-card">
+      <div class="m-title">Dev Agent Usage</div>
+      <div class="m-val" style="color:#60a5fa;">${devTok.toLocaleString()} <span style="font-size:11px;color:var(--text-muted);">/ ${devAlloc.toLocaleString()}</span></div>
+    </div>
+    <div class="m-card">
+      <div class="m-title">Review Agent Usage</div>
+      <div class="m-val" style="color:#c084fc;">${revTok.toLocaleString()} <span style="font-size:11px;color:var(--text-muted);">tok</span></div>
+    </div>
+  `;
 }
 
 function renderTimeline(events) {
   const timeline = document.getElementById("timeline");
   if (!events || events.length === 0) {
-    timeline.innerHTML = "<p style='color:#888;'>No pipeline events yet. Waiting on logs...</p>";
+    timeline.innerHTML = "<p style='color:#888;'>Waiting for agent events...</p>";
     return;
   }
 
   timeline.innerHTML = events.map(event => {
+    const cfg = EVENT_CONFIG[event.event] || { label: event.event.replace(/_/g, " "), agent: "Agent", code: "LOG" };
     const { event: name, timestamp, level, ...details } = event;
-    const levelClass = level === "error" ? "error" : "info";
     const timeLabel = timestamp ? new Date(timestamp).toLocaleTimeString() : "";
-    const detailsJson = Object.keys(details).length
-      ? `<pre>${escapeHtml(JSON.stringify(details, null, 2))}</pre>`
-      : "";
+    const isErr = level === "error" || name === "workflow_failed";
+    const dotCls = isErr ? "error" : (name === "pipeline_finished" ? "success" : "active");
 
     return `
-      <div class="timeline-item ${levelClass}">
-        <div class="timeline-dot"></div>
-        <div class="timeline-title">${escapeHtml(eventTitle(event))}<time>${timeLabel}</time></div>
-        ${detailsJson}
+      <div class="timeline-item">
+        <div class="timeline-dot ${dotCls}"></div>
+        <div class="timeline-card">
+          <div class="card-head">
+            <span class="agent-tag">${cfg.code || cfg.agent}</span>
+            <span class="card-title">${escapeHtml(cfg.label)}</span>
+            <span class="card-time">${timeLabel}</span>
+          </div>
+          ${Object.keys(details).length ? `<pre>${escapeHtml(JSON.stringify(details, null, 2))}</pre>` : ''}
+        </div>
       </div>
     `;
   }).join("");
 }
 
-function renderFullLogs(logs) {
-  const container = document.getElementById("fullLogs");
-  if (!logs || logs.length === 0) {
-    container.innerHTML = "<p style='color:var(--muted);'>No logs yet.</p>";
-    return;
-  }
-  container.innerHTML = logs.map(job => `
-    <div class="log-job-block">
-      <h4>${escapeHtml(job.job_name)}</h4>
-      <pre>${escapeHtml(job.lines.join("\n"))}</pre>
-    </div>
-  `).join("");
-}
-
-function renderJobSummary(jobs) {
-  const container = document.getElementById("jobSummary");
-  if (!jobs || jobs.length === 0) {
-    container.innerHTML = "";
-    return;
-  }
-  container.innerHTML = jobs.map(job => {
-    const cls = job.conclusion === "success" ? "success" : job.conclusion === "failure" ? "failure" : "";
-    return `<span class="job-pill ${cls}">${escapeHtml(job.name)}: ${job.status}${job.conclusion ? " (" + job.conclusion + ")" : ""}</span>`;
-  }).join("");
-}
-
 async function pollStatus(runId) {
   try {
-    const response = await fetch(`/status/${runId}`);
-    const data = await response.json();
-
+    const res = await fetch(`/status/${runId}`);
+    const data = await res.json();
     if (data.error) {
       document.getElementById("runStatusText").textContent = `Error: ${data.error}`;
       return;
     }
 
     document.getElementById("runStatusText").innerHTML =
-      `Status: <strong>${data.run.status}</strong> ${data.run.conclusion ? "(" + data.run.conclusion + ")" : ""} — ` +
-      `<a href="${data.run.html_url}" target="_blank">View on GitHub</a>`;
+      `Status: <strong>${data.run.status}</strong> ${data.run.conclusion ? "(" + data.run.conclusion + ")" : ""} — <a href="${data.run.html_url}" target="_blank">View on GitHub ↗</a>`;
 
-    renderJobSummary(data.jobs);
-    renderTimeline(data.events);
-    renderFullLogs(data.logs);
+    renderFlow(data.events || []);
+    renderMetrics(data.events || []);
+    renderTimeline(data.events || []);
 
     if (data.run.status !== "completed") {
       pollHandle = setTimeout(() => pollStatus(runId), 3000);
     }
   } catch (err) {
-    document.getElementById("runStatusText").textContent = `Polling error: ${err}`;
+    document.getElementById("runStatusText").textContent = `Polling: ${err.message}`;
     pollHandle = setTimeout(() => pollStatus(runId), 5000);
   }
 }
 
 async function loadPastRuns() {
-  const response = await fetch("/runs");
-  const runsData = await response.json();
+  const res = await fetch("/runs");
+  const data = await res.json();
   const container = document.getElementById("pastRuns");
+  if (!Array.isArray(data)) return;
 
-  if (runsData.error) {
-    container.innerHTML = `<p>Error loading runs: ${escapeHtml(runsData.error)}</p>`;
-    return;
-  }
-
-  container.innerHTML = runsData.map(run => `
+  container.innerHTML = data.map(r => `
     <div class="run-card">
-      <div>Status: ${run.status} ${run.conclusion ? "(" + run.conclusion + ")" : ""}</div>
-      <div>Started: ${run.created_at}</div>
-      <a href="${run.html_url}" target="_blank">View on GitHub</a>
-      &nbsp;|&nbsp;
-      <a href="#" onclick="startPolling(${run.id}); return false;">Show timeline</a>
+      <div>
+        <strong>Run #${r.id}</strong> — <span class="pill ${r.conclusion === 'success' ? 'green' : r.conclusion === 'failure' ? 'red' : 'yellow'}">${r.conclusion || r.status}</span>
+        <div style="font-size:12px; color:var(--text-muted); margin-top:2px;">${new Date(r.created_at).toLocaleString()}</div>
+      </div>
+      <div>
+        <a href="${r.html_url}" target="_blank">GitHub ↗</a> | 
+        <a href="#" onclick="startPolling(${r.id}); return false;">View Timeline</a>
+      </div>
     </div>
   `).join("");
 }
@@ -186,51 +325,34 @@ async function loadPastRuns() {
 function startPolling(runId) {
   activeRunId = runId;
   if (pollHandle) clearTimeout(pollHandle);
-  document.getElementById("timeline").innerHTML = "";
   pollStatus(runId);
 }
 
 document.getElementById("submitBtn").addEventListener("click", async () => {
-  const taskText = document.getElementById("taskText").value.trim();
-  if (!taskText) return;
+  const text = document.getElementById("taskText").value.trim();
+  if (!text) return;
+  document.getElementById("runStatusText").textContent = "Dispatching workflow to Orchestrator...";
 
-  document.getElementById("runStatusText").textContent = "Dispatching workflow...";
-  document.getElementById("timeline").innerHTML = "";
-
-  const response = await fetch("/trigger", {
+  const res = await fetch("/trigger", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ task_text: taskText }),
+    body: JSON.stringify({ task_text: text })
   });
-  const data = await response.json();
-
+  const data = await res.json();
   if (data.error) {
     document.getElementById("runStatusText").textContent = `Error: ${data.error}`;
     return;
   }
-
-  document.getElementById("runStatusText").textContent = "Workflow dispatched. Locating run...";
-
+  document.getElementById("runStatusText").textContent = "Dispatched. Locating run...";
   setTimeout(async () => {
-    const runsResponse = await fetch("/runs");
-    const runsData = await runsResponse.json();
-    if (runsData.length > 0) {
-      startPolling(runsData[0].id);
-    }
+    const runsRes = await fetch("/runs");
+    const runs = await runsRes.json();
+    if (runs && runs.length > 0) startPolling(runs[0].id);
     loadPastRuns();
   }, 4000);
 });
 
-document.getElementById("toggleLogsBtn").addEventListener("click", () => {
-  const panel = document.getElementById("fullLogs");
-  const btn = document.getElementById("toggleLogsBtn");
-  const showing = panel.style.display !== "none";
-  panel.style.display = showing ? "none" : "block";
-  btn.textContent = showing ? "Show full raw logs" : "Hide full raw logs";
-});
-
 loadPastRuns();
 </script>
-
 </body>
 </html>

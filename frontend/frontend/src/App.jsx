@@ -1,6 +1,8 @@
 import { useState, useEffect, useRef, useCallback } from 'react'
 import './App.css'
 import TimelineView from './components/TimelineView'
+import PipelineFlowBar from './components/PipelineFlowBar'
+import TokenMetricsBar from './components/TokenMetricsBar'
 import JobPill from './components/JobPill'
 import PastRunCard from './components/PastRunCard'
 
@@ -206,6 +208,20 @@ export default function App() {
         </div>
       )}
 
+      {/* ── Pipeline Execution Flow ────────── */}
+      {(activeRunId || runData) && (
+        <PipelineFlowBar
+          events={runData?.events ?? []}
+          isRunActive={!!isRunActive}
+          conclusion={runData?.run?.conclusion}
+        />
+      )}
+
+      {/* ── Token Economy & DCBA Metrics ───── */}
+      {runData?.events?.length > 0 && (
+        <TokenMetricsBar events={runData.events} />
+      )}
+
       {/* ── Job pills ──────────────────────── */}
       {runData?.jobs?.length > 0 && (
         <div className="jobs-row">
@@ -219,7 +235,7 @@ export default function App() {
       {(activeRunId || runData) && (
         <div className="timeline-wrap">
           <SectionHeader
-            title="Agent Timeline"
+            title="Agent Execution Stream & Timeline"
             count={runData?.events?.length ?? 0}
           />
           <TimelineView

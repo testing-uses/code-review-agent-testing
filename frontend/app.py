@@ -54,7 +54,7 @@ import zipfile
 from io import BytesIO
 
 import requests
-from flask import Flask, jsonify, request, send_from_directory
+from flask import Flask, jsonify, render_template, request, send_from_directory
 
 try:
     from flask_cors import CORS
@@ -73,18 +73,15 @@ WORKFLOW_FILE = os.environ.get(
 GITHUB_API_BASE = "https://api.github.com"
 PIPELINE_PREFIX = "[PIPELINE] "
 
-# Where the built React app lives after `npm run build` inside
-# frontend/react. If this directory doesn't exist yet (you haven't built
-# the React app, or you're only running Vite's dev server separately),
-# Flask simply won't have anything to serve at "/" -- that's fine in dev
-# mode, since Vite serves the UI on its own port instead.
-REACT_BUILD_DIR = os.path.join(
-    os.path.dirname(os.path.abspath(__file__)),
-    "react",
-    "dist",
-)
+# Where the built React app lives after `npm run build` inside frontend/frontend or frontend/react.
+REACT_CANDIDATE_DIRS = [
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), "frontend", "dist"),
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), "react", "dist"),
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), "dist"),
+]
+REACT_BUILD_DIR = next((d for d in REACT_CANDIDATE_DIRS if os.path.isdir(d)), REACT_CANDIDATE_DIRS[0])
 
-app = Flask(__name__, static_folder=None)
+app = Flask(__name__, static_folder=None, template_folder="templates")
 
 # Only needed for DEV MODE (Vite on a different port calling this API
 # cross-origin). Harmless to leave enabled in production mode too, since
@@ -139,29 +136,30 @@ def handle_unexpected_error(error):
     }), 500
 
 
-# ---- Serve the built React app (production mode) ----
-# In dev mode (React app running via `npm run dev` on its own port), this
-# route simply won't be hit for the UI -- you'd open Vite's dev server
-# URL instead, and only the API routes below matter.
+# ---- Serve the built React app (production mode) or fallback template ----
 @app.route("/", defaults={"path": ""})
 @app.route("/<path:path>")
 def serve_react_app(path):
-    if not os.path.isdir(REACT_BUILD_DIR):
-        return jsonify({
-            "error": (
-                "React build not found at frontend/react/dist. "
-                "Run `npm run build` inside frontend/react for production "
-                "mode, or run the Vite dev server separately (npm run dev) "
-                "and use its URL instead of this Flask server's root."
-            ),
-        }), 404
+    # If React dist exists, serve it
+    if os.path.isdir(REACT_BUILD_DIR) and os.path.isfile(os.path.join(REACT_BUILD_DIR, "index.html")):
+        requested_path = os.path.join(REACT_BUILD_DIR, path)
+        if path and os.path.isfile(requested_path):
+            return send_from_directory(REACT_BUILD_DIR, path)
+        return send_from_directory(REACT_BUILD_DIR, "index.html")
 
-    requested_path = os.path.join(REACT_BUILD_DIR, path)
-    if path and os.path.isfile(requested_path):
-        return send_from_directory(REACT_BUILD_DIR, path)
+    # If static React build doesn't exist, fall back to Jinja template if available
+    template_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "templates", "index.html")
+    if os.path.exists(template_path) and (not path or path == "index.html"):
+        return render_template("index.html")
 
-    # SPA fallback -- any non-file path (client-side route) gets index.html
-    return send_from_directory(REACT_BUILD_DIR, "index.html")
+    return jsonify({
+        "error": (
+            "React build not found at frontend/frontend/dist. "
+            "Run `npm run build` inside frontend/frontend for production "
+            "mode, or run the Vite dev server separately (npm run dev) "
+            "and use its URL instead of this Flask server's root."
+        ),
+    }), 404
 
 
 # ---- API routes used by App.jsx ----

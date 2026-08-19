@@ -6,9 +6,9 @@ export default defineConfig({
   plugins: [react()],
   server: {
     proxy: {
-      '/trigger': 'http://localhost:5000',
-      '/runs': 'http://localhost:5000',
-      '/status': 'http://localhost:5000',
+      '/trigger': 'http://127.0.0.1:5000',
+      '/runs': 'http://127.0.0.1:5000',
+      '/status': 'http://127.0.0.1:5000',
     },
   },
 })
