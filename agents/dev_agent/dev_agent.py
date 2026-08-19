@@ -75,9 +75,9 @@ REWRITE_SIMILARITY_FLOOR = 0.5
 # measured prompt cost, not from these percentages (see run()).
 PRELIM_OUTPUT_FRACTION = 0.35
 PRELIM_KB_FRACTION_OF_REMAINDER = 0.35
-MIN_OUTPUT_TOKENS = 900
+MIN_OUTPUT_TOKENS = 2500
 MAX_OUTPUT_TOKENS_CAP = 8000
-PROMPT_SAFETY_MARGIN_TOKENS = 150  # buffer for estimate_tokens() slack
+PROMPT_SAFETY_MARGIN_TOKENS = 200  # buffer for estimate_tokens() slack
 
 _EXCLUDED_DIR_NAMES = {
     ".git",
