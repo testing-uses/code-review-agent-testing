@@ -24,7 +24,7 @@ ENV_FILE = PROJECT_ROOT / ".env"
 load_dotenv(dotenv_path=ENV_FILE)
 
 CHARS_PER_TOKEN_ESTIMATE = 3.3
-DEFAULT_GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
+DEFAULT_GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.7-flash")
 
 DEV_AGENT_RESPONSE_SCHEMA = {
     "type": "object",

@@ -77,7 +77,7 @@ def get_changed_files(repo_root: str, base_sha: str, head_sha: str):
     return [f for f in result.stdout.strip().splitlines() if f]
 
 
-DEFAULT_MODEL = os.getenv("DEFAULT_MODEL", "gemini-2.5-flash")
+DEFAULT_MODEL = os.getenv("DEFAULT_MODEL", "gemini-3.7-flash")
 
 
 def run_review_for_pr(
