@@ -30,12 +30,15 @@ load_dotenv(dotenv_path=ENV_FILE)
 
 CHARS_PER_TOKEN_ESTIMATE = 3.3
 DEFAULT_GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
-DEFAULT_GROQ_MODEL = os.getenv("GROQ_MODEL", "llama-3.1-70b-versatile")
+DEFAULT_GROQ_MODEL = os.getenv("GROQ_MODEL", "qwen-2.5-coder-32b")
 GROQ_FALLBACK_MODELS = [
-    "llama-3.1-70b-versatile",
+    "qwen-2.5-coder-32b",
+    "qwen-2.5-32b",
+    "qwen/qwen-2.5-coder-32b",
+    "qwen/qwen-2.5-32b",
+    "qwen-qwq-32b",
+    "llama-3.3-70b-versatile",
     "llama-3.1-8b-instant",
-    "llama3-70b-8192",
-    "llama3-8b-8192",
 ]
 
 
@@ -397,8 +400,9 @@ def call_groq_json(
         except APIStatusError as error:
             last_error = error
 
-            if error.status_code == 404:
-                # Model not found on this Groq account/tier -> try next model in candidate list
+            err_str = str(error).lower()
+            if error.status_code == 404 or (error.status_code == 400 and ("decommissioned" in err_str or "not supported" in err_str or "model" in err_str)):
+                # Model not supported/decommissioned on this Groq account/tier -> try next model in candidate list
                 continue
 
             if error.status_code == 413:
@@ -408,7 +412,7 @@ def call_groq_json(
                     "not reduce one request's size."
                 ) from error
 
-            if error.status_code in {400, 401}:
+            if error.status_code == 401:
                 raise RuntimeError(
                     f"Groq rejected the request (HTTP {error.status_code}): "
                     f"{error}"
