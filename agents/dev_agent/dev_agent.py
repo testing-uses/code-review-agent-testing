@@ -1,10 +1,6 @@
 """agents/dev_agent/dev_agent.py
 
-Dev Agent with optional Cerebras provider support.
-
-Existing Groq behavior remains available. Set DEV_AGENT_PROVIDER=cerebras
-and CEREBRAS_API_KEY to use Cerebras for the Dev Agent only. The rest of the
-workflow is unchanged.
+Dev Agent with primary Google Gemini support and Groq fallback.
 """
 
 from __future__ import annotations
@@ -28,10 +24,11 @@ from context_selector import select_context  # noqa: E402
 from groq_client import (  # noqa: E402
     CHARS_PER_TOKEN_ESTIMATE,
     DEV_AGENT_RESPONSE_SCHEMA,
+    GeminiKeyPool,
     GroqKeyPool,
-    call_cerebras_json,
     call_gemini_json,
     call_groq_json,
+    call_llm_json,
     estimate_tokens,
     load_prompt,
 )
@@ -41,12 +38,12 @@ from patch_apply import apply_unified_diff, write_full_file  # noqa: E402
 PROMPTS_DIR = os.path.join(os.path.dirname(__file__), "..", "prompts")
 DEFAULT_PROVIDER = os.environ.get(
     "DEV_AGENT_PROVIDER",
-    "gemini" if os.getenv("GEMINI_API_KEY") else "groq",
+    "gemini" if (os.getenv("GEMINI_API_KEY_1") or os.getenv("GEMINI_API_KEY")) else "groq",
 ).lower()
 
 DEFAULT_MODEL = os.environ.get(
     "DEV_AGENT_MODEL",
-    "gpt-oss-120b",
+    "gemini-2.5-flash" if DEFAULT_PROVIDER == "gemini" else "llama-3.3-70b-versatile",
 )
 
 GROUND_TRUTH_MAX_FILES = 4
@@ -310,33 +307,24 @@ def _call_provider(
     allocated_budget_tokens: int,
 ) -> Dict[str, Any]:
     if provider == "gemini":
-        gemini_model = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
-        return call_gemini_json(
-            model=gemini_model,
-            system_prompt=system_prompt,
-            user_prompt=user_prompt,
-            max_output_tokens=max_output_tokens,
-            response_schema=DEV_AGENT_RESPONSE_SCHEMA,
-        )
+        gemini_model = os.getenv("GEMINI_MODEL", model if "gemini" in model else "gemini-2.5-flash")
+        try:
+            return call_gemini_json(
+                model=gemini_model,
+                system_prompt=system_prompt,
+                user_prompt=user_prompt,
+                max_output_tokens=max_output_tokens,
+                response_schema=DEV_AGENT_RESPONSE_SCHEMA,
+            )
+        except Exception as gemini_error:
+            print(f"[DEV_AGENT] Gemini call failed ({gemini_error}). Falling back to Groq...", flush=True)
 
-    if provider == "cerebras":
-        cerebras_model = os.getenv(
-            "CEREBRAS_MODEL",
-            "gpt-oss-120b",
-        )
-
-        return call_cerebras_json(
-            model=cerebras_model,
-            system_prompt=system_prompt,
-            user_prompt=user_prompt,
-            max_output_tokens=max_output_tokens,
-        )
-
+    # Groq or automatic fallback
+    groq_model = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
     key_pool = GroqKeyPool()
-
     return call_groq_json(
         key_pool=key_pool,
-        model=model,
+        model=groq_model,
         system_prompt=system_prompt,
         user_prompt=user_prompt,
         max_output_tokens=max_output_tokens,

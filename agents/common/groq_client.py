@@ -1,7 +1,8 @@
 """agents/common/groq_client.py
 
-Provider client used by the pipeline. Existing Groq behavior is preserved;
-Cerebras is added as an optional provider for Dev Agent calls.
+Unified LLM Provider client.
+Primary: Google Gemini (supports 2-3 rotating API keys: GEMINI_API_KEY_1..3).
+Fallback: Groq (supports rotating API keys: GROQ_API_KEY_1..5).
 """
 
 from __future__ import annotations
@@ -9,8 +10,10 @@ from __future__ import annotations
 import json
 import os
 import time
+import urllib.error
+import urllib.request
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from dotenv import load_dotenv
 from groq import (
@@ -26,6 +29,8 @@ ENV_FILE = PROJECT_ROOT / ".env"
 load_dotenv(dotenv_path=ENV_FILE)
 
 CHARS_PER_TOKEN_ESTIMATE = 3.3
+DEFAULT_GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
+DEFAULT_GROQ_MODEL = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
 
 DEV_AGENT_RESPONSE_SCHEMA = {
     "type": "object",
@@ -75,25 +80,67 @@ def estimate_tokens(text: str) -> int:
     return max(1, int(len(text) / CHARS_PER_TOKEN_ESTIMATE))
 
 
-class GroqKeyPool:
-    """Rotate across GROQ_API_KEY_1..N on retryable failures."""
+class GeminiKeyPool:
+    """Rotate across GEMINI_API_KEY_1..3 and legacy GEMINI_API_KEY."""
 
     def __init__(self) -> None:
-        self.keys = [
+        raw_keys = [
+            os.getenv("GEMINI_API_KEY_1"),
+            os.getenv("GEMINI_API_KEY_2"),
+            os.getenv("GEMINI_API_KEY_3"),
+            os.getenv("GEMINI_API_KEY"),
+        ]
+        # Deduplicate while preserving order
+        seen = set()
+        self.keys: List[str] = []
+        for k in raw_keys:
+            if k and k.strip() and k.strip() not in seen:
+                seen.add(k.strip())
+                self.keys.append(k.strip())
+
+        self.current_index = 0
+
+    def has_keys(self) -> bool:
+        return len(self.keys) > 0
+
+    def keys_in_order(self) -> List[Tuple[int, str]]:
+        key_count = len(self.keys)
+        return [
+            ((self.current_index + offset) % key_count, self.keys[(self.current_index + offset) % key_count])
+            for offset in range(key_count)
+        ]
+
+    def mark_success(self, key_index: int) -> None:
+        self.current_index = key_index
+
+    def rotate_after_failure(self, key_index: int) -> None:
+        if self.keys:
+            self.current_index = (key_index + 1) % len(self.keys)
+
+
+class GroqKeyPool:
+    """Rotate across GROQ_API_KEY_1..5 on retryable failures."""
+
+    def __init__(self) -> None:
+        raw_keys = [
             os.getenv("GROQ_API_KEY_1"),
             os.getenv("GROQ_API_KEY_2"),
             os.getenv("GROQ_API_KEY_3"),
             os.getenv("GROQ_API_KEY_4"),
             os.getenv("GROQ_API_KEY_5"),
+            os.getenv("GROQ_API_KEY"),
         ]
-        self.keys = [key for key in self.keys if key]
-
-        if not self.keys:
-            raise RuntimeError(
-                "No Groq API keys configured (GROQ_API_KEY_1..5)."
-            )
+        seen = set()
+        self.keys: List[str] = []
+        for k in raw_keys:
+            if k and k.strip() and k.strip() not in seen:
+                seen.add(k.strip())
+                self.keys.append(k.strip())
 
         self.current_index = 0
+
+    def has_keys(self) -> bool:
+        return len(self.keys) > 0
 
     def clients_in_order(self):
         key_count = len(self.keys)
@@ -105,7 +152,8 @@ class GroqKeyPool:
         self.current_index = key_index
 
     def rotate_after_failure(self, key_index: int) -> None:
-        self.current_index = (key_index + 1) % len(self.keys)
+        if self.keys:
+            self.current_index = (key_index + 1) % len(self.keys)
 
 
 def preflight_check(
@@ -136,7 +184,7 @@ def _response_format(response_schema: Optional[dict]) -> dict:
     return {
         "type": "json_schema",
         "json_schema": {
-            "name": "dev_agent_edit",
+            "name": "agent_output",
             "strict": True,
             "schema": response_schema,
         },
@@ -159,153 +207,116 @@ def _extract_result(response: Any, provider: str) -> Dict[str, Any]:
 
     usage = getattr(response, "usage", None)
     result["_usage"] = {
-        "prompt_tokens": getattr(
-            usage,
-            "prompt_tokens",
-            None,
-        ),
-        "completion_tokens": getattr(
-            usage,
-            "completion_tokens",
-            None,
-        ),
-        "total_tokens": getattr(
-            usage,
-            "total_tokens",
-            None,
-        ),
+        "prompt_tokens": getattr(usage, "prompt_tokens", None),
+        "completion_tokens": getattr(usage, "completion_tokens", None),
+        "total_tokens": getattr(usage, "total_tokens", None),
         "provider": provider,
     }
     return result
 
 
 def call_gemini_json(
-    model: str,
-    system_prompt: str,
-    user_prompt: str,
-    max_output_tokens: int,
+    model: str = DEFAULT_GEMINI_MODEL,
+    system_prompt: str = "",
+    user_prompt: str = "",
+    max_output_tokens: int = 2000,
     response_schema: Optional[dict] = None,
+    key_pool: Optional[GeminiKeyPool] = None,
 ) -> Dict[str, Any]:
-    """Call Google Gemini API with JSON output mode."""
-    import urllib.request
-    import urllib.error
+    """Call Google Gemini API with rotating GEMINI_API_KEY_1..3 keys."""
+    if key_pool is None:
+        key_pool = GeminiKeyPool()
 
-    api_key = os.getenv("GEMINI_API_KEY")
-    if not api_key:
-        raise RuntimeError("GEMINI_API_KEY is not configured.")
+    if not key_pool.has_keys():
+        raise RuntimeError("No Gemini API keys configured (GEMINI_API_KEY_1..3 or GEMINI_API_KEY).")
 
     clean_model = model.replace("models/", "")
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/{clean_model}:generateContent?key={api_key}"
+    last_error: Optional[Exception] = None
 
-    payload: Dict[str, Any] = {
-        "contents": [
-            {"role": "user", "parts": [{"text": user_prompt}]}
-        ],
-        "generationConfig": {
-            "responseMimeType": "application/json",
-            "temperature": 0.0,
-            "maxOutputTokens": max_output_tokens,
-        }
-    }
-    if system_prompt and system_prompt.strip():
-        payload["systemInstruction"] = {
-            "parts": [{"text": system_prompt}]
-        }
-    if response_schema:
-        payload["generationConfig"]["responseSchema"] = response_schema
+    for key_index, api_key in key_pool.keys_in_order():
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/{clean_model}:generateContent?key={api_key}"
 
-    req = urllib.request.Request(
-        url,
-        data=json.dumps(payload).encode("utf-8"),
-        headers={"Content-Type": "application/json"}
-    )
-    try:
-        with urllib.request.urlopen(req) as resp:
-            data = json.loads(resp.read().decode("utf-8"))
-            candidates = data.get("candidates", [])
-            if not candidates or "content" not in candidates[0]:
-                raise RuntimeError(f"Gemini API returned no candidate content: {data}")
-            content_text = candidates[0]["content"]["parts"][0]["text"]
-            result = json.loads(content_text)
-            if not isinstance(result, dict):
-                raise RuntimeError("Gemini returned JSON, but it was not an object.")
-
-            usage = data.get("usageMetadata", {})
-            result["_usage"] = {
-                "prompt_tokens": usage.get("promptTokenCount"),
-                "completion_tokens": usage.get("candidatesTokenCount"),
-                "total_tokens": usage.get("totalTokenCount"),
-                "provider": "gemini",
+        payload: Dict[str, Any] = {
+            "contents": [
+                {"role": "user", "parts": [{"text": user_prompt}]}
+            ],
+            "generationConfig": {
+                "responseMimeType": "application/json",
+                "temperature": 0.0,
+                "maxOutputTokens": max_output_tokens,
             }
-            return result
-    except urllib.error.HTTPError as error:
-        err_body = error.read().decode("utf-8")
-        raise RuntimeError(f"Gemini API HTTP Error {error.code}: {err_body}") from error
+        }
+        if system_prompt and system_prompt.strip():
+            payload["systemInstruction"] = {
+                "parts": [{"text": system_prompt}]
+            }
+        if response_schema:
+            payload["generationConfig"]["responseSchema"] = response_schema
 
-
-def call_cerebras_json(
-    model: str,
-    system_prompt: str,
-    user_prompt: str,
-    max_output_tokens: int,
-) -> Dict[str, Any]:
-    """Call Gemini if GEMINI_API_KEY is configured, else fallback to Cerebras."""
-    if os.getenv("GEMINI_API_KEY"):
-        gemini_model = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
-        return call_gemini_json(
-            model=gemini_model,
-            system_prompt=system_prompt,
-            user_prompt=user_prompt,
-            max_output_tokens=max_output_tokens,
+        req = urllib.request.Request(
+            url,
+            data=json.dumps(payload).encode("utf-8"),
+            headers={"Content-Type": "application/json"}
         )
 
-    try:
-        from openai import OpenAI
-    except ImportError as error:
-        raise RuntimeError(
-            "Cerebras support requires the 'openai' package. "
-            "Install it with: pip install openai"
-        ) from error
+        try:
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                data = json.loads(resp.read().decode("utf-8"))
+                candidates = data.get("candidates", [])
+                if not candidates or "content" not in candidates[0]:
+                    raise RuntimeError(f"Gemini API returned no candidate content: {data}")
 
-    api_key = os.getenv("CEREBRAS_API_KEY")
-    if not api_key:
-        raise RuntimeError("Neither GEMINI_API_KEY nor CEREBRAS_API_KEY is configured.")
+                content_text = candidates[0]["content"]["parts"][0]["text"]
+                result = json.loads(content_text)
+                if not isinstance(result, dict):
+                    raise RuntimeError("Gemini returned JSON, but it was not an object.")
 
-    client = OpenAI(
-        api_key=api_key,
-        base_url="https://api.cerebras.ai/v1",
-    )
+                usage = data.get("usageMetadata", {})
+                result["_usage"] = {
+                    "prompt_tokens": usage.get("promptTokenCount"),
+                    "completion_tokens": usage.get("candidatesTokenCount"),
+                    "total_tokens": usage.get("totalTokenCount"),
+                    "provider": "gemini",
+                    "key_index": key_index,
+                }
+                key_pool.mark_success(key_index)
+                return result
 
-    response = client.chat.completions.create(
-        model=model,
-        messages=[
-            {
-                "role": "system",
-                "content": system_prompt,
-            },
-            {
-                "role": "user",
-                "content": user_prompt,
-            },
-        ],
-        temperature=0,
-        max_tokens=max_output_tokens,
-        response_format={"type": "json_object"},
-    )
+        except urllib.error.HTTPError as error:
+            err_body = error.read().decode("utf-8")
+            last_error = RuntimeError(f"Gemini HTTP {error.code} on key #{key_index + 1}: {err_body}")
+            key_pool.rotate_after_failure(key_index)
+            # Retry next key on 429 quota/rate limit or 5xx server errors
+            if error.code in (429, 500, 502, 503, 504):
+                time.sleep(1)
+                continue
+            # For bad request or invalid key, also rotate to try next available key
+            continue
 
-    return _extract_result(response, "cerebras")
+        except Exception as error:
+            last_error = error
+            key_pool.rotate_after_failure(key_index)
+            continue
+
+    raise RuntimeError(f"All Gemini API keys failed. Last error: {last_error}")
 
 
 def call_groq_json(
-    key_pool: GroqKeyPool,
-    model: str,
-    system_prompt: str,
-    user_prompt: str,
-    max_output_tokens: int,
+    key_pool: Optional[GroqKeyPool] = None,
+    model: str = DEFAULT_GROQ_MODEL,
+    system_prompt: str = "",
+    user_prompt: str = "",
+    max_output_tokens: int = 2000,
     token_ceiling: int = 8000,
     response_schema: Optional[dict] = None,
 ) -> Dict[str, Any]:
-    """Call Groq with optional strict JSON Schema output."""
+    """Call Groq with rotating GROQ_API_KEY_1..5 keys."""
+    if key_pool is None:
+        key_pool = GroqKeyPool()
+
+    if not key_pool.has_keys():
+        raise RuntimeError("No Groq API keys configured (GROQ_API_KEY_1..5).")
+
     preflight_check(
         system_prompt,
         user_prompt,
@@ -391,6 +402,48 @@ def call_groq_json(
         f"All Groq attempts failed after {max_attempts} attempts. "
         f"Last error: {last_error}"
     )
+
+
+def call_llm_json(
+    system_prompt: str,
+    user_prompt: str,
+    max_output_tokens: int = 2000,
+    token_ceiling: int = 8000,
+    response_schema: Optional[dict] = None,
+    gemini_model: str = DEFAULT_GEMINI_MODEL,
+    groq_model: str = DEFAULT_GROQ_MODEL,
+) -> Dict[str, Any]:
+    """Primary: Gemini with key rotation. Fallback: Groq with key rotation."""
+    gemini_pool = GeminiKeyPool()
+    groq_pool = GroqKeyPool()
+
+    # If Gemini keys are available, try Gemini first
+    if gemini_pool.has_keys():
+        try:
+            return call_gemini_json(
+                model=gemini_model,
+                system_prompt=system_prompt,
+                user_prompt=user_prompt,
+                max_output_tokens=max_output_tokens,
+                response_schema=response_schema,
+                key_pool=gemini_pool,
+            )
+        except Exception as gemini_err:
+            print(f"[LLM_FALLBACK] Gemini failed ({gemini_err}). Falling back to Groq...", flush=True)
+
+    # Fallback to Groq
+    if groq_pool.has_keys():
+        return call_groq_json(
+            key_pool=groq_pool,
+            model=groq_model,
+            system_prompt=system_prompt,
+            user_prompt=user_prompt,
+            max_output_tokens=max_output_tokens,
+            token_ceiling=token_ceiling,
+            response_schema=response_schema,
+        )
+
+    raise RuntimeError("No LLM provider keys configured. Set GEMINI_API_KEY_1..3 or GROQ_API_KEY_1..5 in .env")
 
 
 def load_prompt(prompts_dir: str, filename: str) -> str:
