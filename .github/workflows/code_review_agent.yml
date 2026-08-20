@@ -46,7 +46,6 @@ jobs:
 
       - name: Run review agent
         env:
-          CEREBRAS_API_KEY: ${{ secrets.CEREBRAS_API_KEY }} 
           GROQ_API_KEY_1: ${{ secrets.GROQ_API_KEY_1 }}
           GROQ_API_KEY_2: ${{ secrets.GROQ_API_KEY_2 }}
           GROQ_API_KEY_3: ${{ secrets.GROQ_API_KEY_3 }}

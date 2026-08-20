@@ -55,10 +55,6 @@ jobs:
       # never has to parse through the task text's actual content at all.
       - name: Run orchestrator (Dev Agent -> PR -> Code Review Agent)
         env:
-          CEREBRAS_API_KEY: ${{ secrets.CEREBRAS_API_KEY }}
-          DEV_AGENT_PROVIDER: cerebras
-          DEV_AGENT_MODEL: gpt-oss-120b
-          CEREBRAS_MODEL: gpt-oss-120b
           GROQ_API_KEY_1: ${{ secrets.GROQ_API_KEY_1 }}
           GROQ_API_KEY_2: ${{ secrets.GROQ_API_KEY_2 }}
           GROQ_API_KEY_3: ${{ secrets.GROQ_API_KEY_3 }}
