@@ -37,8 +37,6 @@ GROQ_FALLBACK_MODELS = [
     "qwen/qwen-2.5-coder-32b",
     "qwen/qwen-2.5-32b",
     "qwen-qwq-32b",
-    "llama-3.3-70b-versatile",
-    "llama-3.1-8b-instant",
 ]
 
 
