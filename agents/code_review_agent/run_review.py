@@ -77,6 +77,9 @@ def get_changed_files(repo_root: str, base_sha: str, head_sha: str):
     return [f for f in result.stdout.strip().splitlines() if f]
 
 
+DEFAULT_MODEL = os.getenv("DEFAULT_MODEL", "gemini-2.5-flash")
+
+
 def run_review_for_pr(
     repo_root: str,
     base_sha: str,
@@ -85,7 +88,7 @@ def run_review_for_pr(
     pr_number: int,
     budget_tokens: int = 3000,
     db_path: str = None,
-    model: str = "openai/gpt-oss-120b",
+    model: str = DEFAULT_MODEL,
     post_to_github: bool = True,
 ) -> dict:
     """The function master_agent.py has been trying to import all along.
@@ -168,7 +171,7 @@ def main():
     parser.add_argument("--head-sha", required=True)
     parser.add_argument("--repo-full-name", required=True)
     parser.add_argument("--pr-number", type=int, required=True)
-    parser.add_argument("--model", default="openai/gpt-oss-120b")
+    parser.add_argument("--model", default=DEFAULT_MODEL)
     parser.add_argument("--context-token-budget", type=int, default=3000)
     parser.add_argument("--db-path", default=os.path.join(KB_DIR, "kb.sqlite3"))
     args = parser.parse_args()

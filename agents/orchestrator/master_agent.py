@@ -25,7 +25,13 @@ sys.path.insert(0, os.path.join(_AGENTS_ROOT, "common"))
 from path_bootstrap import bootstrap  # noqa: E402
 bootstrap()
 
-from groq_client import GroqKeyPool, call_groq_json, load_prompt  # noqa: E402
+from groq_client import (  # noqa: E402
+    GroqKeyPool,
+    call_groq_json,
+    call_llm_json,
+    load_prompt,
+    DEFAULT_GEMINI_MODEL,
+)
 from github_ops import commit_and_push, create_pull_request, get_base_sha  # noqa: E402
 from dcba import (  # noqa: E402
     ComplexitySignals,
@@ -44,7 +50,7 @@ import dev_agent  # noqa: E402
 
 PROMPTS_DIR = os.path.join(os.path.dirname(__file__), "..", "prompts")
 METRICS_PATH = os.path.join(os.path.dirname(__file__), "metrics.jsonl")
-DEFAULT_MODEL = "openai/gpt-oss-120b"
+DEFAULT_MODEL = os.getenv("DEFAULT_MODEL", DEFAULT_GEMINI_MODEL)
 
 
 def emit(event: str, **details) -> dict:
@@ -322,16 +328,13 @@ def run_pipeline(
 
     try:
         summary_prompt = load_prompt(PROMPTS_DIR, "orchestrator_summary_prompt.md")
-        key_pool = GroqKeyPool()
         summary_user_prompt = (
             f"## Task\n{task_text}\n\n"
             f"## Dev Agent result\n{json.dumps(dev_result)}\n\n"
             f"## Code Review Agent result\n{json.dumps(review_result)}\n\n"
             f"## Final workflow state\n{state.value}"
         )
-        summary = call_groq_json(
-            key_pool=key_pool,
-            model=DEFAULT_MODEL,
+        summary = call_llm_json(
             system_prompt=summary_prompt,
             user_prompt=summary_user_prompt,
             max_output_tokens=250,

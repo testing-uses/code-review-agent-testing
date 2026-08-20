@@ -25,10 +25,17 @@ _AGENTS_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(_AGENTS_ROOT, "common"))
 from path_bootstrap import bootstrap  # noqa: E402
 bootstrap()
-from groq_client import GroqKeyPool, call_groq_json, load_prompt  # noqa: E402
+from groq_client import (  # noqa: E402
+    GroqKeyPool,
+    call_groq_json,
+    call_llm_json,
+    load_prompt,
+    DEFAULT_GEMINI_MODEL,
+)
 
 PROMPTS_DIR = os.path.join(os.path.dirname(__file__), "..", "prompts")
 RUBRIC_PATH = os.path.join(os.path.dirname(__file__), "rubric.yaml")
+DEFAULT_MODEL = os.getenv("DEFAULT_MODEL", DEFAULT_GEMINI_MODEL)
 
 
 def load_rubric() -> Dict[str, Any]:
@@ -48,12 +55,11 @@ def review_pull_request(
     repo_root: str,
     changed_files: List[str],
     context_text: str,
-    model: str = "openai/gpt-oss-120b",
+    model: str = DEFAULT_MODEL,
     max_output_tokens: int = 1800,
     token_ceiling: int = 6000,
 ) -> Dict[str, Any]:
     rubric = load_rubric()
-    key_pool = GroqKeyPool()
 
     emit("review_context_ready", changed_files=changed_files,
          context_chars=len(context_text))
@@ -66,10 +72,12 @@ def review_pull_request(
         f"## Changed files\n{changed_files}\n\n"
         f"## Context\n{context_text}"
     )
-    raw_review = call_groq_json(
-        key_pool=key_pool, model=model, system_prompt=reviewer_system,
-        user_prompt=reviewer_user, max_output_tokens=max_output_tokens,
+    raw_review = call_llm_json(
+        system_prompt=reviewer_system,
+        user_prompt=reviewer_user,
+        max_output_tokens=max_output_tokens,
         token_ceiling=token_ceiling,
+        gemini_model=model if "gemini" in model else DEFAULT_GEMINI_MODEL,
     )
     raw_usage = raw_review.pop("_usage", {}) or {}
 
@@ -106,10 +114,12 @@ def review_pull_request(
         f"## Context\n{context_text}"
     )
     verifier_max_tokens = min(max_output_tokens, max(350, len(all_findings) * 200))
-    verified = call_groq_json(
-        key_pool=key_pool, model=model, system_prompt=verifier_system,
-        user_prompt=verifier_user, max_output_tokens=verifier_max_tokens,
+    verified = call_llm_json(
+        system_prompt=verifier_system,
+        user_prompt=verifier_user,
+        max_output_tokens=verifier_max_tokens,
         token_ceiling=token_ceiling,
+        gemini_model=model if "gemini" in model else DEFAULT_GEMINI_MODEL,
     )
     verifier_usage = verified.pop("_usage", {}) or {}
 

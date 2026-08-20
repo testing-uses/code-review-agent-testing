@@ -30,7 +30,37 @@ load_dotenv(dotenv_path=ENV_FILE)
 
 CHARS_PER_TOKEN_ESTIMATE = 3.3
 DEFAULT_GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
-DEFAULT_GROQ_MODEL = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
+DEFAULT_GROQ_MODEL = os.getenv("GROQ_MODEL", "llama-3.1-70b-versatile")
+GROQ_FALLBACK_MODELS = [
+    "llama-3.1-70b-versatile",
+    "llama-3.1-8b-instant",
+    "llama3-70b-8192",
+    "llama3-8b-8192",
+]
+
+
+def _convert_to_gemini_schema(schema: Optional[dict]) -> Optional[dict]:
+    """Convert standard JSON Schema to Gemini's OpenAPI subset."""
+    if not schema or not isinstance(schema, dict):
+        return None
+
+    gemini_schema: Dict[str, Any] = {}
+    for k, v in schema.items():
+        if k == "additionalProperties":
+            continue  # Gemini REST API does not support additionalProperties
+        if k == "type" and isinstance(v, str):
+            gemini_schema["type"] = v.upper()
+        elif k == "properties" and isinstance(v, dict):
+            gemini_schema["properties"] = {
+                pk: _convert_to_gemini_schema(pv) for pk, pv in v.items()
+            }
+        elif k == "items" and isinstance(v, dict):
+            gemini_schema["items"] = _convert_to_gemini_schema(v)
+        elif k == "required" and isinstance(v, list):
+            gemini_schema["required"] = v
+        elif k in ("description", "enum", "format", "nullable"):
+            gemini_schema[k] = v
+    return gemini_schema
 
 DEV_AGENT_RESPONSE_SCHEMA = {
     "type": "object",
@@ -250,8 +280,9 @@ def call_gemini_json(
             payload["systemInstruction"] = {
                 "parts": [{"text": system_prompt}]
             }
-        if response_schema:
-            payload["generationConfig"]["responseSchema"] = response_schema
+        gemini_schema = _convert_to_gemini_schema(response_schema)
+        if gemini_schema:
+            payload["generationConfig"]["responseSchema"] = gemini_schema
 
         req = urllib.request.Request(
             url,
@@ -310,7 +341,7 @@ def call_groq_json(
     token_ceiling: int = 8000,
     response_schema: Optional[dict] = None,
 ) -> Dict[str, Any]:
-    """Call Groq with rotating GROQ_API_KEY_1..5 keys."""
+    """Call Groq with rotating GROQ_API_KEY_1..5 keys and model fallbacks."""
     if key_pool is None:
         key_pool = GroqKeyPool()
 
@@ -325,15 +356,17 @@ def call_groq_json(
     )
 
     last_error: Optional[Exception] = None
-    max_attempts = max(2, len(key_pool.keys) * 2)
+    candidate_models = [model] + [m for m in GROQ_FALLBACK_MODELS if m != model]
+    max_attempts = max(2, len(key_pool.keys) * len(candidate_models))
 
     for attempt in range(max_attempts):
         clients = list(key_pool.clients_in_order())
         key_index, client = clients[attempt % len(clients)]
+        current_model = candidate_models[(attempt // len(clients)) % len(candidate_models)]
 
         try:
             response = client.chat.completions.create(
-                model=model,
+                model=current_model,
                 messages=[
                     {
                         "role": "system",
@@ -352,6 +385,7 @@ def call_groq_json(
             result = _extract_result(response, "groq")
             result["_usage"]["key_index"] = key_index
             result["_usage"]["attempt"] = attempt + 1
+            result["_usage"]["model"] = current_model
             key_pool.mark_success(key_index)
             return result
 
@@ -362,6 +396,10 @@ def call_groq_json(
 
         except APIStatusError as error:
             last_error = error
+
+            if error.status_code == 404:
+                # Model not found on this Groq account/tier -> try next model in candidate list
+                continue
 
             if error.status_code == 413:
                 raise RuntimeError(
