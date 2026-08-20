@@ -31,7 +31,7 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install groq pyyaml PyGithub ruff bandit python-dotenv
+          pip install pyyaml PyGithub ruff bandit python-dotenv
 
       - name: Build/update knowledge base
         run: |
@@ -58,11 +58,6 @@ jobs:
           GEMINI_API_KEY_1: ${{ secrets.GEMINI_API_KEY_1 }}
           GEMINI_API_KEY_2: ${{ secrets.GEMINI_API_KEY_2 }}
           GEMINI_API_KEY_3: ${{ secrets.GEMINI_API_KEY_3 }}
-          GROQ_API_KEY_1: ${{ secrets.GROQ_API_KEY_1 }}
-          GROQ_API_KEY_2: ${{ secrets.GROQ_API_KEY_2 }}
-          GROQ_API_KEY_3: ${{ secrets.GROQ_API_KEY_3 }}
-          GROQ_API_KEY_4: ${{ secrets.GROQ_API_KEY_4 }}
-          GROQ_API_KEY_5: ${{ secrets.GROQ_API_KEY_5 }}
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TASK_TEXT: ${{ inputs.task_text }}
           REPO_FULL_NAME: ${{ github.repository }}

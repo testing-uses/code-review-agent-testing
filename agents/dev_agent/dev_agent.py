@@ -36,15 +36,8 @@ from kb_schema import get_connection  # noqa: E402
 from patch_apply import apply_unified_diff, write_full_file  # noqa: E402
 
 PROMPTS_DIR = os.path.join(os.path.dirname(__file__), "..", "prompts")
-DEFAULT_PROVIDER = os.environ.get(
-    "DEV_AGENT_PROVIDER",
-    "gemini" if (os.getenv("GEMINI_API_KEY_1") or os.getenv("GEMINI_API_KEY")) else "groq",
-).lower()
-
-DEFAULT_MODEL = os.environ.get(
-    "DEV_AGENT_MODEL",
-    "gemini-2.5-flash" if DEFAULT_PROVIDER == "gemini" else "llama-3.3-70b-versatile",
-)
+DEFAULT_PROVIDER = "gemini"
+DEFAULT_MODEL = os.environ.get("DEV_AGENT_MODEL", os.getenv("GEMINI_MODEL", "gemini-2.5-flash"))
 
 GROUND_TRUTH_MAX_FILES = 4
 REWRITE_SIMILARITY_FLOOR = 0.5
@@ -306,29 +299,12 @@ def _call_provider(
     max_output_tokens: int,
     allocated_budget_tokens: int,
 ) -> Dict[str, Any]:
-    if provider == "gemini":
-        gemini_model = os.getenv("GEMINI_MODEL", model if "gemini" in model else "gemini-2.5-flash")
-        try:
-            return call_gemini_json(
-                model=gemini_model,
-                system_prompt=system_prompt,
-                user_prompt=user_prompt,
-                max_output_tokens=max_output_tokens,
-                response_schema=DEV_AGENT_RESPONSE_SCHEMA,
-            )
-        except Exception as gemini_error:
-            print(f"[DEV_AGENT] Gemini call failed ({gemini_error}). Falling back to Groq...", flush=True)
-
-    # Groq or automatic fallback
-    groq_model = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
-    key_pool = GroqKeyPool()
-    return call_groq_json(
-        key_pool=key_pool,
-        model=groq_model,
+    gemini_model = os.getenv("GEMINI_MODEL", model if "gemini" in model else "gemini-2.5-flash")
+    return call_gemini_json(
+        model=gemini_model,
         system_prompt=system_prompt,
         user_prompt=user_prompt,
         max_output_tokens=max_output_tokens,
-        token_ceiling=allocated_budget_tokens,
         response_schema=DEV_AGENT_RESPONSE_SCHEMA,
     )
 
