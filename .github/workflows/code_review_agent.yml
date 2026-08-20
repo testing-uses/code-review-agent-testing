@@ -30,14 +30,14 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install groq openai pyyaml PyGithub ruff bandit python-dotenv
+          pip install groq pyyaml PyGithub ruff bandit python-dotenv
 
       # context_builder.py now resolves symbol context from the SAME
       # central KB the Dev Agent uses (agents/knowledge_base/kb.sqlite3)
       # instead of its own separate repo_map.py cache. If this workflow
       # runs independently of master_agent.py's orchestrated flow (e.g. a
       # human pushes directly to a PR branch), the KB needs to exist and
-      # be current, so build/update it here too — build_or_update() only
+      # be current, so build/update it here too -- build_or_update() only
       # re-parses files whose git blob SHA changed, so this is cheap when
       # the KB is already fresh from the Dev Agent Pipeline run.
       - name: Build/update knowledge base
@@ -46,6 +46,9 @@ jobs:
 
       - name: Run review agent
         env:
+          GEMINI_API_KEY_1: ${{ secrets.GEMINI_API_KEY_1 }}
+          GEMINI_API_KEY_2: ${{ secrets.GEMINI_API_KEY_2 }}
+          GEMINI_API_KEY_3: ${{ secrets.GEMINI_API_KEY_3 }}
           GROQ_API_KEY_1: ${{ secrets.GROQ_API_KEY_1 }}
           GROQ_API_KEY_2: ${{ secrets.GROQ_API_KEY_2 }}
           GROQ_API_KEY_3: ${{ secrets.GROQ_API_KEY_3 }}
@@ -58,4 +61,4 @@ jobs:
             --repo-full-name "${{ github.repository }}" \
             --pr-number "${{ github.event.pull_request.number }}" \
             --db-path agents/knowledge_base/kb.sqlite3 \
-            --model openai/gpt-oss-120b
+            --model llama-3.3-70b-versatile

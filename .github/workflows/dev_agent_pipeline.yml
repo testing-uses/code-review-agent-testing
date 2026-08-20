@@ -31,7 +31,7 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install groq openai pyyaml PyGithub ruff bandit python-dotenv
+          pip install groq pyyaml PyGithub ruff bandit python-dotenv
 
       - name: Build/update knowledge base
         run: |
@@ -43,10 +43,10 @@ jobs:
           git config user.email "dev-agent-bot@users.noreply.github.com"
 
       # CHANGE: task_text is now passed through env, not interpolated
-      # directly into the shell command. ${{ inputs.task_text }} used to
-      # be substituted literally into a quoted, backslash-continued bash
-      # argument -- if the task text itself contained a trailing "\", an
-      # unescaped '"', or a real newline, it could break the continuation
+      # directly into the shell run: block. When task text contains
+      # double quotes (common in natural task descriptions), bash's
+      # word-splitting would truncate the argument at the quote and
+      # treat everything after it as broken shell syntax or break the
       # chain mid-command. Bash would then silently treat everything
       # after the break (including --repo-full-name and --base-branch)
       # as a separate command, which is exactly what caused:
@@ -55,6 +55,9 @@ jobs:
       # never has to parse through the task text's actual content at all.
       - name: Run orchestrator (Dev Agent -> PR -> Code Review Agent)
         env:
+          GEMINI_API_KEY_1: ${{ secrets.GEMINI_API_KEY_1 }}
+          GEMINI_API_KEY_2: ${{ secrets.GEMINI_API_KEY_2 }}
+          GEMINI_API_KEY_3: ${{ secrets.GEMINI_API_KEY_3 }}
           GROQ_API_KEY_1: ${{ secrets.GROQ_API_KEY_1 }}
           GROQ_API_KEY_2: ${{ secrets.GROQ_API_KEY_2 }}
           GROQ_API_KEY_3: ${{ secrets.GROQ_API_KEY_3 }}
