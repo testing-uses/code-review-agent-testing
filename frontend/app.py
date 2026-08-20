@@ -98,13 +98,10 @@ if _CORS_AVAILABLE:
 
 
 def github_headers():
-    token = os.environ.get("GITHUB_DISPATCH_TOKEN")
+    token = os.environ.get("GITHUB_DISPATCH_TOKEN") or os.environ.get("GITHUB_TOKEN")
 
     if not token:
-        raise RuntimeError(
-            "GITHUB_DISPATCH_TOKEN is not configured. "
-            "Set it in the same terminal before starting Flask."
-        )
+        return {}
 
     return {
         "Authorization": f"Bearer {token}",
@@ -114,9 +111,12 @@ def github_headers():
 
 
 def github_get(path, params=None):
+    headers = github_headers()
+    if not headers:
+        return None
     return requests.get(
         f"{GITHUB_API_BASE}{path}",
-        headers=github_headers(),
+        headers=headers,
         params=params,
         timeout=30,
     )
@@ -172,12 +172,15 @@ def trigger():
     if not task_text:
         return jsonify({"error": "task_text is required"}), 400
 
+    headers = github_headers()
+    if not headers:
+        return jsonify({
+            "error": "GITHUB_DISPATCH_TOKEN is not configured. Set it in .env or your terminal to trigger live GitHub Actions workflows."
+        }), 400
+
     response = requests.post(
-        (
-            f"{GITHUB_API_BASE}/repos/{REPO_FULL_NAME}"
-            f"/actions/workflows/{WORKFLOW_FILE}/dispatches"
-        ),
-        headers=github_headers(),
+        f"{GITHUB_API_BASE}/repos/{REPO_FULL_NAME}/actions/workflows/{WORKFLOW_FILE}/dispatches",
+        headers=headers,
         json={
             "ref": "main",
             "inputs": {"task_text": task_text},
@@ -201,8 +204,9 @@ def runs():
         params={"per_page": 10},
     )
 
-    if response.status_code != 200:
-        return jsonify({"error": response.text}), response.status_code
+    if response is None or response.status_code != 200:
+        # Graceful empty response for local dev without tokens
+        return jsonify([])
 
     workflow_runs = response.json().get("workflow_runs", [])
 
