@@ -52,9 +52,15 @@ import json
 import os
 import zipfile
 from io import BytesIO
+from pathlib import Path
 
 import requests
+from dotenv import load_dotenv
 from flask import Flask, jsonify, render_template, request, send_from_directory
+
+# Load root .env file
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+load_dotenv(dotenv_path=PROJECT_ROOT / ".env")
 
 try:
     from flask_cors import CORS
